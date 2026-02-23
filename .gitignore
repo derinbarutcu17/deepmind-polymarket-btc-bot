@@ -1,0 +1,27 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+env/
+.env/
+.venv/
+env.bak/
+venv.bak/
+
+# Environment Variables (CRITICAL)
+.env
+.env.local
+.env.*.local
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project specific
+logs/
+*.log
