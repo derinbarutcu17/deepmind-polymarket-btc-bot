@@ -23,34 +23,41 @@ class Portfolio:
         self.initial_capacity = initial_balance
         self.open_positions: List[Position] = []
         
-    def execute_buy(self, market_title: str, condition_id: str, token_id: str, side: str, amount_usd: float, limit_price: float) -> bool:
-        """Simulates a MAKER LIMIT BUY order."""
+    def execute_buy(self, market_title: str, condition_id: str, token_id: str, side: str, amount_usd: float, limit_price: float, is_taker: bool = False) -> bool:
+        """Simulates a BUY order."""
         if self.balance < amount_usd:
-            logger.warning(f"[PORTFOLIO] Insufficient fake balance (${self.balance:.2f}) to execute ${amount_usd:.2f} buy.")
+            logger.warning(f"⚠️  [PORTFOLIO] Insufficient fake balance (${self.balance:.2f}) to execute ${amount_usd:.2f} buy.", extra={"markup": True})
             return False
             
-        self.balance -= amount_usd
+        fee = amount_usd * 0.015 if is_taker else 0.0
+        self.balance -= (amount_usd + fee)
+        
         pos = Position(market_title, condition_id, token_id, side, amount_usd, limit_price)
         self.open_positions.append(pos)
         
-        logger.info(f"[PORTFOLIO] Executed Buy: {pos.num_shares:.2f} shares of {side} at ${limit_price:.3f}")
-        logger.info(f"[PORTFOLIO] Available Cash: ${self.balance:.2f} (Total P&L: {self.get_total_pnl_str()})")
+        logger.info(f"📥 [bold green][PORTFOLIO] Executed {'TAKER' if is_taker else 'MAKER'} Buy:[/bold green] {pos.num_shares:.2f} shares of {side} at ${limit_price:.3f}" + (f" (Fee: ${fee:.3f})" if fee > 0 else ""), extra={"markup": True})
+        logger.info(f"💵 [PORTFOLIO] Available Cash: [bold]${self.balance:.2f}[/bold] (Total P&L: {self.get_total_pnl_str()})", extra={"markup": True})
         return True
         
-    def execute_sell(self, position: Position, limit_price: float, reason: str = "Manual") -> bool:
-        """Simulates a MAKER LIMIT SELL order to dump a position early."""
+    def execute_sell(self, position: Position, limit_price: float, reason: str = "Manual", is_taker: bool = False) -> bool:
+        """Simulates a SELL order to dump a position early."""
         if position not in self.open_positions:
-            logger.warning("[PORTFOLIO] Attempted to sell a position not in portfolio.")
+            logger.warning("⚠️  [PORTFOLIO] Attempted to sell a position not in portfolio.", extra={"markup": True})
             return False
             
         revenue = position.num_shares * limit_price
-        profit = revenue - position.amount_usd
-        self.balance += revenue
+        fee = revenue * 0.015 if is_taker else 0.0
+        profit = (revenue - fee) - position.amount_usd
+        
+        self.balance += (revenue - fee)
         self.open_positions.remove(position)
         
-        logger.info(f"[PORTFOLIO] EXECUTED EARLY SELL ({reason}): Sold {position.num_shares:.2f} shares of {position.side} at ${limit_price:.3f}")
-        logger.info(f"[PORTFOLIO] Trade P&L: ${profit:+.2f} ({profit/position.amount_usd*100:+.1f}%)")
-        logger.info(f"[PORTFOLIO] Available Cash: ${self.balance:.2f} (Total P&L: {self.get_total_pnl_str()})")
+        logger.info(f"📤 [bold cyan][PORTFOLIO] EXECUTED EARLY {'TAKER' if is_taker else 'MAKER'} SELL ({reason}):[/bold cyan] Sold {position.num_shares:.2f} shares of {position.side} at ${limit_price:.3f}" + (f" (Fee: ${fee:.3f})" if fee > 0 else ""), extra={"markup": True})
+        
+        # Color profit text based on whether it's positive or negative
+        pnl_color = "green" if profit >= 0 else "red"
+        logger.info(f"💸 [PORTFOLIO] Trade P&L: [bold {pnl_color}]${profit:+.2f} ({profit/position.amount_usd*100:+.1f}%)[/bold {pnl_color}]", extra={"markup": True})
+        logger.info(f"💵 [PORTFOLIO] Available Cash: [bold]${self.balance:.2f}[/bold] (Total P&L: {self.get_total_pnl_str()})", extra={"markup": True})
         return True
         
     def resolve_market(self, condition_id: str, winning_token_id: str):
@@ -60,7 +67,7 @@ class Portfolio:
         if not positions_to_resolve:
             return
             
-        logger.info(f"[PORTFOLIO] Resolving {len(positions_to_resolve)} positions for market condition {condition_id[:8]}...")
+        logger.info(f"🔄 [PORTFOLIO] Resolving {len(positions_to_resolve)} positions for market condition {condition_id[:8]}...", extra={"markup": True})
         
         for pos in positions_to_resolve:
             if pos.token_id == winning_token_id:
@@ -68,14 +75,14 @@ class Portfolio:
                 revenue = pos.num_shares * 1.00
                 profit = revenue - pos.amount_usd
                 self.balance += revenue
-                logger.info(f"[PORTFOLIO] WON MARKET ({pos.side}): Payout ${revenue:.2f} (Profit: ${profit:+.2f})")
+                logger.info(f"🏆 [bold green][PORTFOLIO] WON MARKET ({pos.side}):[/bold green] Payout ${revenue:.2f} (Profit: [bold]+${profit:.2f}[/bold])", extra={"markup": True})
             else:
                 # Loss: 1 share = $0.00
-                logger.info(f"[PORTFOLIO] LOST MARKET ({pos.side}): Shares expired worthless. (Loss: -${pos.amount_usd:.2f})")
+                logger.info(f"💥 [bold red][PORTFOLIO] LOST MARKET ({pos.side}):[/bold red] Shares expired worthless. (Loss: [bold]-${pos.amount_usd:.2f}[/bold])", extra={"markup": True})
                 
             self.open_positions.remove(pos)
             
-        logger.info(f"[PORTFOLIO] Available Cash: ${self.balance:.2f} (Total P&L: {self.get_total_pnl_str()})")
+        logger.info(f"💵 [PORTFOLIO] Available Cash: [bold]${self.balance:.2f}[/bold] (Total P&L: {self.get_total_pnl_str()})", extra={"markup": True})
         
     def get_positions_for_market(self, condition_id: str) -> List[Position]:
         return [p for p in self.open_positions if p.condition_id == condition_id]

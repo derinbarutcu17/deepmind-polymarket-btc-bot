@@ -17,11 +17,10 @@ DRY_RUN = os.getenv("DRY_RUN", "True").lower() in ("true", "1", "t")
 
 # --- Strategy Parameters ---
 TRADE_SIZE_USD = float(os.getenv("TRADE_SIZE_USD", "10.0"))
-TREND_WINDOW_SECONDS = int(os.getenv("TREND_WINDOW_SECONDS", "60"))
+MAX_POSITION_USD = float(os.getenv("MAX_POSITION_USD", "10.0")) # Safety default
 
-# Legacy single-market variables (Optional, can be left blank for 5-min auto-trade)
-TARGET_MARKET_CONDITION_ID = os.getenv("TARGET_MARKET_CONDITION_ID", "")
-TARGET_TOKEN_ID = os.getenv("TARGET_TOKEN_ID", "")
+SHORT_EMA_PERIOD = int(os.getenv("SHORT_EMA_PERIOD", "10"))
+LONG_EMA_PERIOD = int(os.getenv("LONG_EMA_PERIOD", "30"))
 
 if not POLYMARKET_API_KEY or not POLYMARKET_API_SECRET or not POLYMARKET_API_PASSPHRASE:
     print("Warning: Polymarket API keys not fully configured in .env.")
