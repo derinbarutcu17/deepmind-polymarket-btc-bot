@@ -1,19 +1,49 @@
+"""Main entry point with kill switch, MTM circuit breaker, and clean shutdown."""
+import argparse
 import asyncio
 import logging
+import os
+import sys
+import time
+from decimal import Decimal
+from logging.handlers import TimedRotatingFileHandler
+
 from rich.logging import RichHandler
-from polymarket_client import AsyncPMClient
+
+from config import DRY_RUN, CIRCUIT_BREAKER_USD
 from oracle import AsyncOracle
-from strategy import BTCStrategy
+from polymarket_client import AsyncPMClient
 from portfolio import Portfolio
-from config import DRY_RUN
+from strategy import BTCStrategy
+
+# ── Logging ──────────────────────────────────────────────────────────────
+os.makedirs("logs", exist_ok=True)
+
+console_handler = RichHandler(rich_tracebacks=True, show_path=False)
+console_handler.setLevel(logging.INFO)
+
+file_handler = TimedRotatingFileHandler("logs/bot.log", when="midnight", backupCount=7)
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+
+error_handler = TimedRotatingFileHandler("logs/error.log", when="midnight", backupCount=14)
+error_handler.setLevel(logging.ERROR)
+error_handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(message)s",
     datefmt="[%X]",
-    handlers=[RichHandler(rich_tracebacks=True, show_path=False)]
+    handlers=[console_handler, file_handler, error_handler],
 )
 logger = logging.getLogger("Main")
+
+STOP_FILE = "./STOP_TRADING"
+
+
+def _check_kill_switch() -> bool:
+    return os.path.exists(STOP_FILE)
+
 
 async def resolver_loop(pm_client, portfolio, resolving_queue):
     while True:
@@ -29,98 +59,158 @@ async def resolver_loop(pm_client, portfolio, resolving_queue):
             logger.error(f"Resolver loop error: {e}")
         await asyncio.sleep(10)
 
-async def main():
+
+async def main(mode: str = "dry-run"):
+    is_dry = mode in ("dry-run", "staging")
+    os.environ["DRY_RUN"] = "True" if is_dry else "False"
+
     logger.info("--- Starting Async Polymarket BTC Trading Bot ---")
-    logger.info(f"Operational Mode: [bold magenta]{'DRY RUN' if DRY_RUN else 'LIVE TRADING'}[/bold magenta]", extra={"markup": True})
-    
+    logger.info(f"Mode: [bold magenta]{mode.upper()}[/bold magenta]", extra={"markup": True})
+
     portfolio = Portfolio()
     try:
         pm_client = AsyncPMClient()
     except Exception as e:
-        logger.error(f"Cannot initialize the PMClient: {e}")
+        logger.error(f"Cannot initialize PMClient: {e}")
         return
-        
+
     oracle = AsyncOracle()
     strategy = BTCStrategy(portfolio)
-    
-    resolving_queue = {} # slug -> condition_id
+
+    resolving_queue: dict[str, str] = {}
     resolver_task = asyncio.create_task(resolver_loop(pm_client, portfolio, resolving_queue))
-    
-    # Pre-flight market check
+
+    # Pre-flight
     active_market = await pm_client.get_active_market()
     if not active_market:
         logger.error("No active market found on startup. Exiting...")
+        resolver_task.cancel()
+        await pm_client.close()
+        await oracle.close()
         return
-        
-    logger.info(f"🎯 Tracking Market: [bold yellow]{active_market['title']}[/bold yellow]", extra={"markup": True})
 
-    tick_interval = 0.5 # Sub-second ticking for HFT
+    logger.info(
+        f"🎯 Tracking Market: [bold yellow]{active_market['title']}[/bold yellow]",
+        extra={"markup": True},
+    )
 
-    while True:
-        try:
-            # 0. Circuit Breaker
-            if portfolio.balance - portfolio.initial_capacity <= -15.0:
-                logger.error("🚨 [bold red]CIRCUIT BREAKER TRIGGERED[/bold red]: Unacceptable -$15.00 PnL drawdown detected. Halting live loop IMMEDIATELY to protect capital.", extra={"markup": True})
-                pm_client.cancel_all_orders()
+    tick_interval = 0.5
+
+    try:
+        while True:
+            # ── Kill switch ──────────────────────────────────────────────
+            if _check_kill_switch():
+                logger.error(
+                    "🛑 [bold red]STOP_TRADING file detected. Halting immediately.[/bold red]",
+                    extra={"markup": True},
+                )
+                portfolio.cancel_all_pending()
+                if not is_dry:
+                    pm_client.cancel_all_orders()
                 break
 
-            # 1. Fetch Oracle Price using concurrent tasks inside the Oracle class
-            oracle_res = await oracle.fetch_price()
-            price = oracle_res['price']
-            source = oracle_res['source']
-            
-            import time
-            if price == 0.0:
-                await asyncio.sleep(tick_interval)
-                continue
-                
-            # Check market expiration to seamlessly rollover
-            if time.time() >= active_market.get('expires_at', 0):
-                logger.info("Market expired. Appending to resolution queue...", extra={"markup": True})
-                resolving_queue[active_market.get('slug')] = active_market.get('condition_id')
-                
-                logger.info("Fetching the next 5-minute window...")
-                new_market = await pm_client.get_active_market()
-                if new_market:
-                    active_market = new_market
-                    logger.info(f"🎯 Now Tracking: [bold yellow]{active_market['title']}[/bold yellow]", extra={"markup": True})
-                # We do not block here if missing, just let it loop and retry later
-                else:
-                    await asyncio.sleep(5)
-                    continue
-                
-            # 2. Get the trend
-            trend, diff = strategy.get_trend(price)
-            
-            if trend == "NEUTRAL":
-                # Only log debug occasionally if needed, skip orderbook phase
-                await asyncio.sleep(tick_interval)
-                continue
-                
-            logger.info(f"🔮 Oracle: [bold cyan]${price:,.2f}[/bold cyan] ({source}) | Trend: {trend} | Diff: {diff:.2f}", extra={"markup": True})
-                
-            target_token = active_market['yes_token'] if trend == "UP" else active_market['no_token']
-            target_side = "YES (UP)" if trend == "UP" else "NO (DOWN)"
-            
-            # 3. Hit the orderbook
-            book = await pm_client.fetch_orderbook(target_token)
-            
-            # 4. Trigger the brain
-            await strategy.evaluate_and_execute(pm_client, active_market, oracle_res, book, diff, target_token, target_side)
-            
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error(f"Loop Exception: {e}")
-            
-        await asyncio.sleep(tick_interval)
+            try:
+                # ── MTM Circuit Breaker ──────────────────────────────────
+                mark_prices = {}
+                for pos in portfolio.open_positions:
+                    try:
+                        book = await pm_client.fetch_orderbook(pos.token_id)
+                        mark_prices[pos.token_id] = Decimal(str(book.get("bid", 0)))
+                    except Exception:
+                        pass
 
-    logger.info("Cleaning up network sessions...")
-    await pm_client.close()
-    await oracle.close()
+                equity = portfolio.get_total_equity(mark_prices)
+                drawdown = equity - portfolio.initial_capacity
+
+                if drawdown <= -CIRCUIT_BREAKER_USD:
+                    logger.error(
+                        f"🚨 [bold red]CIRCUIT BREAKER[/bold red]: MTM equity drawdown "
+                        f"${drawdown} exceeds -${CIRCUIT_BREAKER_USD}. Halting.",
+                        extra={"markup": True},
+                    )
+                    if not is_dry:
+                        pm_client.cancel_all_orders()
+                    break
+
+                # ── Oracle ───────────────────────────────────────────────
+                oracle_res = await oracle.fetch_price()
+                price = oracle_res["price"]
+
+                if price == 0.0:
+                    await asyncio.sleep(tick_interval)
+                    continue
+
+                # ── Market rollover ──────────────────────────────────────
+                if time.time() >= active_market.get("expires_at", 0):
+                    logger.info("Market expired. Appending to resolution queue...")
+                    resolving_queue[active_market["slug"]] = active_market["condition_id"]
+
+                    new_market = await pm_client.get_active_market()
+                    if new_market:
+                        active_market = new_market
+                        strategy.last_sell_prices.clear()
+                        logger.info(
+                            f"🎯 Now Tracking: [bold yellow]{active_market['title']}[/bold yellow]",
+                            extra={"markup": True},
+                        )
+                    else:
+                        await asyncio.sleep(5)
+                        continue
+
+                # ── Trend ────────────────────────────────────────────────
+                trend, diff = strategy.get_trend(price)
+
+                if trend == "NEUTRAL":
+                    await asyncio.sleep(tick_interval)
+                    continue
+
+                logger.info(
+                    f"🔮 Oracle: [bold cyan]${price:,.2f}[/bold cyan] ({oracle_res['source']}) | "
+                    f"Trend: {trend} | Diff: {diff:.2f}",
+                    extra={"markup": True},
+                )
+
+                target_token = active_market["yes_token"] if trend == "UP" else active_market["no_token"]
+                target_side = "YES (UP)" if trend == "UP" else "NO (DOWN)"
+
+                # ── Orderbook ────────────────────────────────────────────
+                book = await pm_client.fetch_orderbook(target_token)
+
+                # ── Strategy ─────────────────────────────────────────────
+                await strategy.evaluate_and_execute(
+                    pm_client, active_market, oracle_res, book, diff, target_token, target_side,
+                )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Loop Exception: {e}", exc_info=True)
+
+            await asyncio.sleep(tick_interval)
+
+    finally:
+        logger.info("Cleaning up...")
+        resolver_task.cancel()
+        try:
+            await resolver_task
+        except asyncio.CancelledError:
+            pass
+        await pm_client.close()
+        await oracle.close()
+        logger.info("Shutdown complete.")
+
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Polymarket BTC Bot")
+    parser.add_argument(
+        "--mode",
+        choices=["dry-run", "staging", "live"],
+        default="dry-run",
+        help="Operating mode",
+    )
+    args = parser.parse_args()
+
     try:
-        asyncio.run(main())
+        asyncio.run(main(mode=args.mode))
     except KeyboardInterrupt:
-         logger.info("Bot shutting down gracefully.")
+        logger.info("Bot interrupted by user.")

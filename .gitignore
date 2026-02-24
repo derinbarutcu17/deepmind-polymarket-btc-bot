@@ -25,3 +25,7 @@ venv.bak/
 # Project specific
 logs/
 *.log
+.DS_Store
+trades.csv
+reports/
+STOP_TRADING
