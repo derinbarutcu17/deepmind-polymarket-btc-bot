@@ -12,6 +12,7 @@ class BTCStrategy:
         self.price_history = []
         self.last_trend = "NEUTRAL"
         self.last_sell_prices = {}
+        self.live_orders = {}
         
     def _calculate_ema(self, prices, periods):
         if len(prices) < periods:
@@ -111,24 +112,16 @@ class BTCStrategy:
                     else: pm_client.cancel_all_orders()
                 elif order.action == "SELL" and best_ask < order.limit_price - 0.005:
                     logger.info(f"💨 Order Manager: Canceling staled SELL order at ${order.limit_price:.3f}, Ask crashed to ${best_ask:.3f}")
-                    if DRY_RUN: self.portfolio.cancel_pending(order)
-                    else: pm_client.cancel_all_orders()
-        
-        # 1. Position Management
-        for pos in existing_positions:
-            held_book = await pm_client.fetch_orderbook(pos.token_id)
-            held_bid = held_book.get('bid', 0.0)
-            held_ask = held_book.get('ask', 1.0)
-            
-            # 1a. Hard 15% Price Crash Stop Loss (WAVE 3 DIRECTIVE)
             # Dumps lagging bags immediately, ignoring EMA trends if price structurally collapses.
             if held_bid < pos.entry_price * 0.85:
                 sell_limit = float(Decimal(str(held_bid)).quantize(Decimal('0.001'), rounding=ROUND_DOWN)) # Market Dump
                 logger.info(f"💀 [bold red][HARD STOP LOSS][/bold red] Price Crashed > 15%. Bailing out of {pos.side} at TAKER Market ${sell_limit:.3f}.", extra={"markup": True})
                 if DRY_RUN: self.portfolio.execute_sell(pos, sell_limit, reason="Hard Stop Loss", is_taker=True)
                 else: 
-                    pm_client.cancel_all_orders()
-                    await pm_client.place_limit_order(pos.token_id, "SELL", sell_limit, pos.num_shares, post_only=False)
+                    if pos.token_id in self.live_orders:
+                        await pm_client.cancel_order(self.live_orders[pos.token_id])
+                    order_id = await pm_client.place_limit_order(pos.token_id, "SELL", sell_limit, pos.num_shares, post_only=False)
+                    if order_id: self.live_orders[pos.token_id] = order_id
                 self.last_sell_prices[pos.token_id] = sell_limit
                 continue
 
@@ -140,8 +133,10 @@ class BTCStrategy:
                     logger.info(f"💀 [bold red][STOP LOSS][/bold red] Trend Reversed. Bailing out of {pos.side} at TAKER Market ${sell_limit:.3f}.", extra={"markup": True})
                     if DRY_RUN: self.portfolio.execute_sell(pos, sell_limit, reason="Stop Loss", is_taker=True)
                     else: 
-                        pm_client.cancel_all_orders()
-                        await pm_client.place_limit_order(pos.token_id, "SELL", sell_limit, pos.num_shares, post_only=False)
+                        if pos.token_id in self.live_orders:
+                            await pm_client.cancel_order(self.live_orders[pos.token_id])
+                        order_id = await pm_client.place_limit_order(pos.token_id, "SELL", sell_limit, pos.num_shares, post_only=False)
+                        if order_id: self.live_orders[pos.token_id] = order_id
                     self.last_sell_prices[pos.token_id] = sell_limit
                 continue
                 
@@ -159,8 +154,10 @@ class BTCStrategy:
                     logger.info(f"💰 [bold green][TAKE PROFIT][/bold green] Up {profit_margin*100:.1f}%. Selling {pos.side} at MAKER ${sell_limit:.3f}", extra={"markup": True})
                     if DRY_RUN: self.portfolio.execute_sell(pos, sell_limit, reason="Take Profit", is_taker=False)
                     else: 
-                        pm_client.cancel_all_orders()
-                        await pm_client.place_limit_order(pos.token_id, "SELL", sell_limit, pos.num_shares)
+                        if pos.token_id in self.live_orders:
+                            await pm_client.cancel_order(self.live_orders[pos.token_id])
+                        order_id = await pm_client.place_limit_order(pos.token_id, "SELL", sell_limit, pos.num_shares)
+                        if order_id: self.live_orders[pos.token_id] = order_id
                     self.last_sell_prices[pos.token_id] = sell_limit
         
         # 2. Entry
@@ -215,8 +212,10 @@ class BTCStrategy:
                 self.portfolio.execute_buy(active_market['title'], active_market['condition_id'], target_token, target_side, trade_size_usd, limit_price, is_taker=is_taker)
             else:
                 logger.info(f"🚀 [bold magenta][LIVE TRADING][/bold magenta] Limit BUY ${trade_size_usd} | {target_side} @ ${limit_price:.3f} (Post-Only: {post_only})", extra={"markup": True})
-                pm_client.cancel_all_orders() # Clear deck
+                if target_token in self.live_orders:
+                    await pm_client.cancel_order(self.live_orders[target_token])
                 target_size = round(trade_size_usd / limit_price, 2)
-                await pm_client.place_limit_order(target_token, "BUY", limit_price, target_size, post_only=post_only)
+                order_id = await pm_client.place_limit_order(target_token, "BUY", limit_price, target_size, post_only=post_only)
+                if order_id: self.live_orders[target_token] = order_id
         else:
              logger.debug(f"🔒 Holding or Pending {target_side} position. Waiting...")

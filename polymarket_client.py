@@ -147,10 +147,11 @@ class AsyncPMClient:
         except Exception as e:
             logger.error(f"Failed to cancel orders: {e}")
 
-    async def place_limit_order(self, token_id: str, side: str, price: float, size: float, post_only: bool = True) -> bool:
+    async def place_limit_order(self, token_id: str, side: str, price: float, size: float, post_only: bool = True) -> Optional[str]:
         """
         Submits a POST-ONLY Maker limit order safely outside the async event loop.
         If the order threatens to cross the spread and cost Taker fees, Polymarket instantly rejects it.
+        Returns the OrderID string if successful, otherwise None.
         """
         def _build_and_post():
             order_args = OrderArgs(
@@ -171,12 +172,32 @@ class AsyncPMClient:
             
             if res and res.get('success'):
                 logger.info(f"✅ [bold green]Live Order Placed![/bold green] Maker {side} for {size:.2f} shares @ ${price:.3f}", extra={"markup": True})
-                return True
+                return res.get('orderID')
             else:
                 logger.error(f"❌ Order Failed/Rejected (Crossed Spread?): {res.get('errorMsg', res)}")
-                return False
+                return None
         except Exception as e:
             logger.error(f"💥 Live Order API Exception: {e}")
+            return None
+
+    async def cancel_order(self, order_id: str) -> bool:
+        """
+        Targeted cancellation of a specific order ID.
+        """
+        def _cancel():
+            return self.sync_client.cancel(order_id)
+            
+        try:
+            try: loop = asyncio.get_running_loop()
+            except RuntimeError: loop = asyncio.get_event_loop()
+            
+            res = await loop.run_in_executor(None, _cancel)
+            if res and res == "sucesses" or (isinstance(res, dict) and res.get('success', True)):
+                logger.debug(f"🗑️ Cancelled order ID: {order_id[:8]}...")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Failed to cancel order {order_id}: {e}")
             return False
 
     async def check_resolution(self, slug: str) -> Optional[str]:
