@@ -10,6 +10,7 @@ class BTCStrategy:
         self.portfolio = portfolio
         self.price_history = []
         self.last_trend = "NEUTRAL"
+        self.last_sell_prices = {}
         
     def _calculate_ema(self, prices, periods):
         if len(prices) < periods:
@@ -64,8 +65,8 @@ class BTCStrategy:
             limit_price = round(best_bid + 0.001, 3)
             logger.debug(f"Spread wide ({spread:.3f}). Front-running at {limit_price}")
 
-        # SAFETY: Never buy > 0.85 or < 0.15 due to terrible risk/reward on 5-minute spans
-        if limit_price > 0.85 or limit_price < 0.15:
+        # SAFETY: Never buy > 0.95 or < 0.05 due to terrible risk/reward on 5-minute spans (Relaxed for late trends)
+        if limit_price > 0.95 or limit_price < 0.05:
             logger.warning(f"Market skewed ({limit_price:.3f}). Rejecting terrible risk/reward on 5m outcome. Aborting.")
             return None
             
@@ -114,27 +115,38 @@ class BTCStrategy:
         
         # 1. Position Management
         for pos in existing_positions:
+            held_book = await pm_client.fetch_orderbook(pos.token_id)
+            held_bid = held_book.get('bid', 0.0)
+            held_ask = held_book.get('ask', 1.0)
+            
+            # 1a. Hard 15% Price Crash Stop Loss (WAVE 3 DIRECTIVE)
+            # Dumps lagging bags immediately, ignoring EMA trends if price structurally collapses.
+            if held_bid < pos.entry_price * 0.85:
+                sell_limit = round(held_bid, 3) # Market Dump
+                logger.info(f"💀 [bold red][HARD STOP LOSS][/bold red] Price Crashed > 15%. Bailing out of {pos.side} at TAKER Market ${sell_limit:.3f}.", extra={"markup": True})
+                if DRY_RUN: self.portfolio.execute_sell(pos, sell_limit, reason="Hard Stop Loss", is_taker=True)
+                else: 
+                    pm_client.cancel_all_orders()
+                    await pm_client.place_limit_order(pos.token_id, "SELL", sell_limit, pos.num_shares, post_only=False)
+                self.last_sell_prices[pos.token_id] = sell_limit
+                continue
+
             if pos.token_id != target_token:
-                # Holding opposite side
-                # Fetch actual orderbook for held token
-                held_book = await pm_client.fetch_orderbook(pos.token_id)
-                held_bid = held_book.get('bid', 0.0)
-                held_ask = held_book.get('ask', 1.0)
-                
-                # Stop loss at 5 cents drop
+                # Holding opposite side (Trend Reversed) Stop loss at 5 cents drop
                 if pos.entry_price - held_bid >= 0.05:
-                    sell_limit = max(round(held_ask - 0.001, 3), 0.01) # Maker sell near ask
-                    logger.info(f"💀 [bold red][STOP LOSS][/bold red] Trend Reversed. Bailing out of {pos.side} at MAKER ${sell_limit:.3f}.", extra={"markup": True})
-                    if DRY_RUN: self.portfolio.execute_sell(pos, sell_limit, reason="Stop Loss", is_taker=False)
+                    # WAVE 2 DIRECTIVE: PROTOCOL "GET ME OUT"
+                    sell_limit = round(held_bid, 3) # Market Dump
+                    logger.info(f"💀 [bold red][STOP LOSS][/bold red] Trend Reversed. Bailing out of {pos.side} at TAKER Market ${sell_limit:.3f}.", extra={"markup": True})
+                    if DRY_RUN: self.portfolio.execute_sell(pos, sell_limit, reason="Stop Loss", is_taker=True)
                     else: 
                         pm_client.cancel_all_orders()
-                        await pm_client.place_limit_order(pos.token_id, "SELL", sell_limit, pos.num_shares)
+                        await pm_client.place_limit_order(pos.token_id, "SELL", sell_limit, pos.num_shares, post_only=False)
+                    self.last_sell_prices[pos.token_id] = sell_limit
                 continue
                 
             # Holding target side
             if pos.entry_price < best_bid:
                 # We want to take profit using a MAKER limit to avoid the 1.5% taker fee pool.
-                # If we just hit best_bid, we cross the spread and get charged.
                 sell_limit = round(best_ask, 3) if round(best_ask - best_bid, 3) <= 0.01 else round(best_ask - 0.001, 3)
                 
                 profit_margin = sell_limit - pos.entry_price
@@ -144,14 +156,28 @@ class BTCStrategy:
                     else: 
                         pm_client.cancel_all_orders()
                         await pm_client.place_limit_order(pos.token_id, "SELL", sell_limit, pos.num_shares)
+                    self.last_sell_prices[pos.token_id] = sell_limit
         
         # 2. Entry
         if not any(p.token_id == target_token for p in existing_positions) and not any(o.token_id == target_token for o in pending_orders):
+            # WAVE 3 DIRECTIVE: SMART FOMO RE-ENTRY
+            # Do not chase your own tail. Don't buy back in structurally higher than you just sold.
+            if target_token in self.last_sell_prices:
+                if limit_price > self.last_sell_prices[target_token]:
+                    logger.debug(f"Smart Re-entry active: Preventing redundant buy at ${limit_price:.3f} > last sell ${self.last_sell_prices[target_token]:.3f}")
+                    return
+
+            # WAVE 2 DIRECTIVE: HYSTERESIS (Anti-Chop)
+            # If we recently dumped the other side, don't flip back instantly unless momentum strongly confirms it.
+            if abs(diff) < 1.5:
+                logger.debug(f"Hysteresis active: Waiting for stronger momentum confirmation (Diff {abs(diff):.2f} < 1.5) before entry.")
+                return
+
             is_taker = False
             post_only = True
             
-            # The Taker Hybrid Override
-            if abs(diff) > 0.8:
+            # The Taker Hybrid Override (Sniper Scope Raised to 4.0)
+            if abs(diff) > 4.0:
                 logger.warning(f"🚀 [bold red]MASSIVE MOMENTUM DETECTED (Diff: {diff:.2f}) - ENGAGING TAKER OVERRIDE[/bold red]", extra={"markup": True})
                 is_taker = True
                 post_only = False
