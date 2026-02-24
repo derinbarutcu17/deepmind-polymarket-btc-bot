@@ -58,6 +58,12 @@ async def main():
 
     while True:
         try:
+            # 0. Circuit Breaker
+            if portfolio.balance - portfolio.initial_capacity <= -15.0:
+                logger.error("🚨 [bold red]CIRCUIT BREAKER TRIGGERED[/bold red]: Unacceptable -$15.00 PnL drawdown detected. Halting live loop IMMEDIATELY to protect capital.", extra={"markup": True})
+                pm_client.cancel_all_orders()
+                break
+
             # 1. Fetch Oracle Price using concurrent tasks inside the Oracle class
             oracle_res = await oracle.fetch_price()
             price = oracle_res['price']
@@ -108,6 +114,10 @@ async def main():
             logger.error(f"Loop Exception: {e}")
             
         await asyncio.sleep(tick_interval)
+
+    logger.info("Cleaning up network sessions...")
+    await pm_client.close()
+    await oracle.close()
 
 if __name__ == "__main__":
     try:

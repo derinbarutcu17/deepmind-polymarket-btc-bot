@@ -1,6 +1,7 @@
 import logging
 import pandas as pd
 from typing import Optional
+from decimal import Decimal, ROUND_DOWN
 from config import SHORT_EMA_PERIOD, LONG_EMA_PERIOD, DRY_RUN, TRADE_SIZE_USD, MAX_POSITION_USD
 
 logger = logging.getLogger(__name__)
@@ -58,11 +59,11 @@ class BTCStrategy:
         
         # If spread is tight, join the queue. Don't cross.
         if spread <= tick_size:
-            limit_price = round(best_bid, 3) 
+            limit_price = float(Decimal(str(best_bid)).quantize(Decimal('0.001'), rounding=ROUND_DOWN)) 
             logger.debug(f"Spread tight ({spread:.3f}). Joining queue at {limit_price}")
         else:
             # Penny jump if there's room
-            limit_price = round(best_bid + 0.001, 3)
+            limit_price = float(Decimal(str(best_bid + 0.001)).quantize(Decimal('0.001'), rounding=ROUND_DOWN))
             logger.debug(f"Spread wide ({spread:.3f}). Front-running at {limit_price}")
 
         # SAFETY: Never buy > 0.95 or < 0.05 due to terrible risk/reward on 5-minute spans (Relaxed for late trends)
@@ -122,7 +123,7 @@ class BTCStrategy:
             # 1a. Hard 15% Price Crash Stop Loss (WAVE 3 DIRECTIVE)
             # Dumps lagging bags immediately, ignoring EMA trends if price structurally collapses.
             if held_bid < pos.entry_price * 0.85:
-                sell_limit = round(held_bid, 3) # Market Dump
+                sell_limit = float(Decimal(str(held_bid)).quantize(Decimal('0.001'), rounding=ROUND_DOWN)) # Market Dump
                 logger.info(f"💀 [bold red][HARD STOP LOSS][/bold red] Price Crashed > 15%. Bailing out of {pos.side} at TAKER Market ${sell_limit:.3f}.", extra={"markup": True})
                 if DRY_RUN: self.portfolio.execute_sell(pos, sell_limit, reason="Hard Stop Loss", is_taker=True)
                 else: 
@@ -135,7 +136,7 @@ class BTCStrategy:
                 # Holding opposite side (Trend Reversed) Stop loss at 5 cents drop
                 if pos.entry_price - held_bid >= 0.05:
                     # WAVE 2 DIRECTIVE: PROTOCOL "GET ME OUT"
-                    sell_limit = round(held_bid, 3) # Market Dump
+                    sell_limit = float(Decimal(str(held_bid)).quantize(Decimal('0.001'), rounding=ROUND_DOWN)) # Market Dump
                     logger.info(f"💀 [bold red][STOP LOSS][/bold red] Trend Reversed. Bailing out of {pos.side} at TAKER Market ${sell_limit:.3f}.", extra={"markup": True})
                     if DRY_RUN: self.portfolio.execute_sell(pos, sell_limit, reason="Stop Loss", is_taker=True)
                     else: 
@@ -147,7 +148,8 @@ class BTCStrategy:
             # Holding target side
             if pos.entry_price < best_bid:
                 # We want to take profit using a MAKER limit to avoid the 1.5% taker fee pool.
-                sell_limit = round(best_ask, 3) if round(best_ask - best_bid, 3) <= 0.01 else round(best_ask - 0.001, 3)
+                raw_sell = best_ask if (best_ask - best_bid) <= 0.01 else (best_ask - 0.001)
+                sell_limit = float(Decimal(str(raw_sell)).quantize(Decimal('0.001'), rounding=ROUND_DOWN))
                 
                 # WAVE 4 DIRECTIVE: FEE-AWARE PROFIT MARGINS
                 fee_offset = 0.015 if getattr(pos, 'is_taker', False) else 0.0
@@ -202,7 +204,7 @@ class BTCStrategy:
                 logger.warning(f"🚀 [bold red]MASSIVE MOMENTUM DETECTED (Diff: {diff:.2f}) - ENGAGING TAKER OVERRIDE[/bold red]", extra={"markup": True})
                 is_taker = True
                 post_only = False
-                limit_price = round(best_ask, 3) # Cross the spread aggressively
+                limit_price = float(Decimal(str(best_ask)).quantize(Decimal('0.001'), rounding=ROUND_DOWN)) # Cross the spread aggressively
                 # WAVE 4 DIRECTIVE: DYNAMIC CONVICTION SIZING
                 trade_size_usd = min(TRADE_SIZE_USD * 4, MAX_POSITION_USD)
                 logger.info(f"🔥 Sniper Mode Active: SCALING Conviction to ${trade_size_usd:.2f} due to extreme momentum.")
