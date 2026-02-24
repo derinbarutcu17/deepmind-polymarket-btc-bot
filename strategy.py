@@ -176,6 +176,24 @@ class BTCStrategy:
                 logger.debug(f"Hysteresis active: Waiting for stronger momentum confirmation (Diff {abs(diff):.2f} < 1.5) before entry.")
                 return
 
+            # WAVE 5 DIRECTIVE: DYNAMIC SPREAD CONTROL
+            spread = best_ask - best_bid
+            if spread > 0.08:
+                logger.warning(f"🚧 Spread dangerously wide ({spread:.3f} > 0.08). Refusing entry to prevent catastrophic slippage.")
+                return
+
+            # WAVE 5 DIRECTIVE: ORDER FLOW IMBALANCE (OFI)
+            bids = orderbook_res.get('bids', [])
+            asks = orderbook_res.get('asks', [])
+            total_bid_vol = sum(float(b.get('size', 0)) for b in bids)
+            total_ask_vol = sum(float(a.get('size', 0)) for a in asks)
+            total_vol = total_bid_vol + total_ask_vol
+            
+            ofi = total_bid_vol / total_vol if total_vol > 0 else 0.5
+            if ofi < 0.30:
+                logger.warning(f"🧱 [bold yellow]OFI BLOCK:[/bold yellow] Huge Ask wall detected (OFI: {ofi:.2f}). Vetoing Pyth '{target_side}' signal.", extra={"markup": True})
+                return
+
             is_taker = False
             post_only = True
             

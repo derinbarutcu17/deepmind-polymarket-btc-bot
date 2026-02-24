@@ -62,12 +62,12 @@ class AsyncPMClient:
                         else:
                             best_ask = 1.0
                             
-                        return {'bid': best_bid, 'ask': best_ask}
+                        return {'bid': best_bid, 'ask': best_ask, 'bids': bids[:5], 'asks': asks[:5]}
                     else:
-                        return {'bid': 0.0, 'ask': 1.0}
+                        return {'bid': 0.0, 'ask': 1.0, 'bids': [], 'asks': []}
         except Exception as e:
             logger.error(f"Error fetching orderbook for token {token_id}: {e}")
-            return {'bid': 0.0, 'ask': 1.0}
+            return {'bid': 0.0, 'ask': 1.0, 'bids': [], 'asks': []}
 
     async def get_active_market(self):
         """
