@@ -16,8 +16,8 @@ BINANCE_API_URL = os.getenv("BINANCE_API_URL", "https://api.binance.com/api/v3/t
 DRY_RUN = os.getenv("DRY_RUN", "True").lower() in ("true", "1", "t")
 
 # --- Strategy Parameters ---
-TRADE_SIZE_USD = float(os.getenv("TRADE_SIZE_USD", "10.0"))
-MAX_POSITION_USD = float(os.getenv("MAX_POSITION_USD", "10.0")) # Safety default
+TRADE_SIZE_USD = float(os.getenv("TRADE_SIZE_USD", "5.0"))
+MAX_POSITION_USD = float(os.getenv("MAX_POSITION_USD", "20.0")) # Safety default
 
 SHORT_EMA_PERIOD = int(os.getenv("SHORT_EMA_PERIOD", "10"))
 LONG_EMA_PERIOD = int(os.getenv("LONG_EMA_PERIOD", "30"))
