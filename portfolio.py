@@ -25,10 +25,13 @@ TICK = D("0.001")
 
 
 def _ensure_csv():
-    """Create CSV with header if it doesn't exist."""
-    if not os.path.exists(TRADES_CSV):
-        with open(TRADES_CSV, "w", newline="") as f:
+    """Create CSV with header if it doesn't exist. M4 fix: atomic creation."""
+    try:
+        fd = os.open(TRADES_CSV, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", newline="") as f:
             csv.writer(f).writerow(TRADES_HEADER)
+    except FileExistsError:
+        pass
 
 
 class PendingOrder:
@@ -430,5 +433,7 @@ class Portfolio:
         return [p for p in self.open_positions if p.condition_id == condition_id]
 
     def get_total_pnl_str(self) -> str:
-        pnl = self.balance - self.initial_capacity
+        """M1 fix: includes unrealized PnL from open positions."""
+        equity = self.get_total_equity()
+        pnl = equity - self.initial_capacity
         return f"${pnl:+.2f}"

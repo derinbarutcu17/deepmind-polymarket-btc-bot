@@ -1,5 +1,11 @@
-"""Async Polymarket CLOB client with retry/backoff and audit logging."""
+"""Async Polymarket CLOB client with retry/backoff and audit logging.
+
+Fixes applied from audit:
+- H1: cancel_all_orders_async wraps blocking call in run_in_executor
+- M5: Audit log directory capped at AUDIT_LOG_MAX_FILES
+"""
 import asyncio
+import glob
 import json
 import logging
 import os
@@ -17,6 +23,7 @@ from config import (
     POLYMARKET_API_PASSPHRASE,
     POLYMARKET_HOST,
     MAX_RETRIES,
+    AUDIT_LOG_MAX_FILES,
 )
 
 logger = logging.getLogger(__name__)
@@ -30,9 +37,16 @@ def _ensure_audit_dir():
 
 
 def _audit_log(label: str, data):
-    """Persist raw API response for audit."""
+    """Persist raw API response for audit. Caps directory at AUDIT_LOG_MAX_FILES (M5 fix)."""
     try:
         _ensure_audit_dir()
+
+        # M5 fix: prune oldest files if over limit
+        files = sorted(glob.glob(os.path.join(_API_LOG_DIR, "*.json")))
+        if len(files) >= AUDIT_LOG_MAX_FILES:
+            for f in files[: len(files) - AUDIT_LOG_MAX_FILES + 1]:
+                os.remove(f)
+
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         path = os.path.join(_API_LOG_DIR, f"{ts}_{label}.json")
         with open(path, "w") as f:
@@ -170,20 +184,24 @@ class AsyncPMClient:
     # ── order management ─────────────────────────────────────────────────
 
     def cancel_all_orders(self):
-        """EMERGENCY ONLY. Nukes all resting orders globally."""
+        """EMERGENCY ONLY — SYNC. Use cancel_all_orders_async in async context."""
         if hasattr(self, "_last_cancel_time") and time.time() - self._last_cancel_time < 2.0:
             return
         self._last_cancel_time = time.time()
 
         logger.warning(
-            "🚨 [EMERGENCY GLOBAL CANCEL] Nuking ALL resting orders. "
-            "This should only trigger from circuit breaker or operator action!"
+            "🚨 [EMERGENCY GLOBAL CANCEL] Nuking ALL resting orders."
         )
         try:
             res = self.sync_client.cancel_all()
             _audit_log("cancel_all", res)
         except Exception as e:
             logger.error(f"Failed to cancel all orders: {e}")
+
+    async def cancel_all_orders_async(self):
+        """H1 fix: Async wrapper for cancel_all — won't block event loop."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.cancel_all_orders)
 
     async def place_limit_order(
         self, token_id: str, side: str, price: float, size: float, post_only: bool = True,

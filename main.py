@@ -1,4 +1,11 @@
-"""Main entry point with kill switch, MTM circuit breaker, and clean shutdown."""
+"""Main entry point with kill switch, MTM circuit breaker, and clean shutdown.
+
+Fixes applied from audit:
+- C2: Sets config.DRY_RUN module attribute directly, not os.environ
+- H1: cancel_all_orders wrapped in run_in_executor
+- H5: Circuit breaker uses pessimistic mark (0.0) on fetch failure
+- M6: Metrics module wired and daily summary triggered
+"""
 import argparse
 import asyncio
 import logging
@@ -10,11 +17,13 @@ from logging.handlers import TimedRotatingFileHandler
 
 from rich.logging import RichHandler
 
-from config import DRY_RUN, CIRCUIT_BREAKER_USD
+import config
+from config import CIRCUIT_BREAKER_USD
 from oracle import AsyncOracle
 from polymarket_client import AsyncPMClient
 from portfolio import Portfolio
 from strategy import BTCStrategy
+from metrics import Metrics
 
 # ── Logging ──────────────────────────────────────────────────────────────
 os.makedirs("logs", exist_ok=True)
@@ -62,12 +71,17 @@ async def resolver_loop(pm_client, portfolio, resolving_queue):
 
 async def main(mode: str = "dry-run"):
     is_dry = mode in ("dry-run", "staging")
-    os.environ["DRY_RUN"] = "True" if is_dry else "False"
+
+    # C2 fix: Set module attribute directly so all imports of config.DRY_RUN pick it up
+    config.DRY_RUN = is_dry
 
     logger.info("--- Starting Async Polymarket BTC Trading Bot ---")
     logger.info(f"Mode: [bold magenta]{mode.upper()}[/bold magenta]", extra={"markup": True})
+    logger.info(f"DRY_RUN = {config.DRY_RUN}")
 
     portfolio = Portfolio()
+    metrics = Metrics()  # M6 fix: wire metrics
+
     try:
         pm_client = AsyncPMClient()
     except Exception as e:
@@ -95,6 +109,8 @@ async def main(mode: str = "dry-run"):
     )
 
     tick_interval = 0.5
+    last_summary_time = time.time()
+    SUMMARY_INTERVAL = 3600  # hourly summary
 
     try:
         while True:
@@ -106,18 +122,20 @@ async def main(mode: str = "dry-run"):
                 )
                 portfolio.cancel_all_pending()
                 if not is_dry:
-                    pm_client.cancel_all_orders()
+                    await pm_client.cancel_all_orders_async()  # H1 fix
                 break
 
             try:
-                # ── MTM Circuit Breaker ──────────────────────────────────
+                # ── MTM Circuit Breaker (H5 fix: pessimistic on failure) ──
                 mark_prices = {}
                 for pos in portfolio.open_positions:
                     try:
                         book = await pm_client.fetch_orderbook(pos.token_id)
                         mark_prices[pos.token_id] = Decimal(str(book.get("bid", 0)))
                     except Exception:
-                        pass
+                        # H5 fix: assume worst case, not cost basis
+                        mark_prices[pos.token_id] = Decimal("0")
+                        logger.warning(f"⚠️ Orderbook fetch failed for {pos.token_id[:8]}. Using mark=0.")
 
                 equity = portfolio.get_total_equity(mark_prices)
                 drawdown = equity - portfolio.initial_capacity
@@ -128,8 +146,9 @@ async def main(mode: str = "dry-run"):
                         f"${drawdown} exceeds -${CIRCUIT_BREAKER_USD}. Halting.",
                         extra={"markup": True},
                     )
+                    metrics.inc("circuit_breaker_trips")
                     if not is_dry:
-                        pm_client.cancel_all_orders()
+                        await pm_client.cancel_all_orders_async()  # H1 fix
                     break
 
                 # ── Oracle ───────────────────────────────────────────────
@@ -137,6 +156,7 @@ async def main(mode: str = "dry-run"):
                 price = oracle_res["price"]
 
                 if price == 0.0:
+                    metrics.inc("oracle_failures")
                     await asyncio.sleep(tick_interval)
                     continue
 
@@ -181,15 +201,28 @@ async def main(mode: str = "dry-run"):
                     pm_client, active_market, oracle_res, book, diff, target_token, target_side,
                 )
 
+                # ── Periodic summary (M6 fix) ────────────────────────────
+                if time.time() - last_summary_time > SUMMARY_INTERVAL:
+                    path = metrics.write_daily_summary()
+                    if path:
+                        logger.info(f"📊 Summary written: {path}")
+                    last_summary_time = time.time()
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Loop Exception: {e}", exc_info=True)
+                metrics.inc("loop_errors")
 
             await asyncio.sleep(tick_interval)
 
     finally:
         logger.info("Cleaning up...")
+        # Final summary
+        path = metrics.write_daily_summary()
+        if path:
+            logger.info(f"📊 Final summary: {path}")
+
         resolver_task.cancel()
         try:
             await resolver_task
