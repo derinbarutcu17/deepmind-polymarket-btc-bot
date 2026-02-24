@@ -19,7 +19,7 @@ class PendingOrder:
         self.timestamp = time.time()
 
 class Position:
-    def __init__(self, market_title: str, condition_id: str, token_id: str, side: str, amount_usd: float, entry_price: float):
+    def __init__(self, market_title: str, condition_id: str, token_id: str, side: str, amount_usd: float, entry_price: float, is_taker: bool = False):
         self.market_title = market_title
         self.condition_id = condition_id
         self.token_id = token_id
@@ -27,6 +27,7 @@ class Position:
         self.amount_usd = amount_usd # Amount initially spent
         self.num_shares = amount_usd / entry_price if entry_price > 0 else 0
         self.entry_price = entry_price
+        self.is_taker = is_taker
         
     def __repr__(self):
         return f"Position(market='{self.market_title}', side='{self.side}', shares={self.num_shares:.2f}, avg_price=${self.entry_price:.3f})"
@@ -50,7 +51,7 @@ class Portfolio:
         self.balance -= (amount_usd + fee)
         
         if is_taker:
-            pos = Position(market_title, condition_id, token_id, side, amount_usd, limit_price)
+            pos = Position(market_title, condition_id, token_id, side, amount_usd, limit_price, is_taker=True)
             self.open_positions.append(pos)
             logger.info(f"📥 [bold green][PORTFOLIO] Executed TAKER Buy:[/bold green] {pos.num_shares:.2f} shares of {side} at ${limit_price:.3f}" + (f" (Fee: ${fee:.3f})" if fee > 0 else ""), extra={"markup": True})
             logger.info(f"💵 [PORTFOLIO] Available Cash: [bold]${self.balance:.2f}[/bold] (Total P&L: {self.get_total_pnl_str()})", extra={"markup": True})
@@ -112,7 +113,7 @@ class Portfolio:
             if order.action == "BUY":
                 # Maker buy gets filled if the market Ask crashes down specifically into our Bid limit
                 if current_best_ask <= order.limit_price:
-                    pos = Position(order.market_title, order.condition_id, order.token_id, order.side, order.amount_usd, order.limit_price)
+                    pos = Position(order.market_title, order.condition_id, order.token_id, order.side, order.amount_usd, order.limit_price, is_taker=False)
                     self.open_positions.append(pos)
                     logger.info(f"✅ [bold green][PORTFOLIO] FILLED MAKER Buy:[/bold green] {pos.num_shares:.2f} shares of {order.side} at ${order.limit_price:.3f}", extra={"markup": True})
                     self.pending_orders.remove(order)

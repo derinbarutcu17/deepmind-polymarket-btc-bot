@@ -1,7 +1,7 @@
 import logging
 import pandas as pd
 from typing import Optional
-from config import SHORT_EMA_PERIOD, LONG_EMA_PERIOD, DRY_RUN, TRADE_SIZE_USD
+from config import SHORT_EMA_PERIOD, LONG_EMA_PERIOD, DRY_RUN, TRADE_SIZE_USD, MAX_POSITION_USD
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +149,10 @@ class BTCStrategy:
                 # We want to take profit using a MAKER limit to avoid the 1.5% taker fee pool.
                 sell_limit = round(best_ask, 3) if round(best_ask - best_bid, 3) <= 0.01 else round(best_ask - 0.001, 3)
                 
-                profit_margin = sell_limit - pos.entry_price
+                # WAVE 4 DIRECTIVE: FEE-AWARE PROFIT MARGINS
+                fee_offset = 0.015 if getattr(pos, 'is_taker', False) else 0.0
+                profit_margin = ((sell_limit - pos.entry_price) / pos.entry_price) - fee_offset
+
                 if profit_margin >= 0.03: 
                     logger.info(f"💰 [bold green][TAKE PROFIT][/bold green] Up {profit_margin*100:.1f}%. Selling {pos.side} at MAKER ${sell_limit:.3f}", extra={"markup": True})
                     if DRY_RUN: self.portfolio.execute_sell(pos, sell_limit, reason="Take Profit", is_taker=False)
@@ -182,13 +185,18 @@ class BTCStrategy:
                 is_taker = True
                 post_only = False
                 limit_price = round(best_ask, 3) # Cross the spread aggressively
+                # WAVE 4 DIRECTIVE: DYNAMIC CONVICTION SIZING
+                trade_size_usd = min(TRADE_SIZE_USD * 4, MAX_POSITION_USD)
+                logger.info(f"🔥 Sniper Mode Active: SCALING Conviction to ${trade_size_usd:.2f} due to extreme momentum.")
+            else:
+                trade_size_usd = TRADE_SIZE_USD
 
             if DRY_RUN:
-                self.portfolio.execute_buy(active_market['title'], active_market['condition_id'], target_token, target_side, TRADE_SIZE_USD, limit_price, is_taker=is_taker)
+                self.portfolio.execute_buy(active_market['title'], active_market['condition_id'], target_token, target_side, trade_size_usd, limit_price, is_taker=is_taker)
             else:
-                logger.info(f"🚀 [bold magenta][LIVE TRADING][/bold magenta] Limit BUY ${TRADE_SIZE_USD} | {target_side} @ ${limit_price:.3f} (Post-Only: {post_only})", extra={"markup": True})
+                logger.info(f"🚀 [bold magenta][LIVE TRADING][/bold magenta] Limit BUY ${trade_size_usd} | {target_side} @ ${limit_price:.3f} (Post-Only: {post_only})", extra={"markup": True})
                 pm_client.cancel_all_orders() # Clear deck
-                target_size = round(TRADE_SIZE_USD / limit_price, 2)
+                target_size = round(trade_size_usd / limit_price, 2)
                 await pm_client.place_limit_order(target_token, "BUY", limit_price, target_size, post_only=post_only)
         else:
              logger.debug(f"🔒 Holding or Pending {target_side} position. Waiting...")

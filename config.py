@@ -19,8 +19,8 @@ DRY_RUN = os.getenv("DRY_RUN", "True").lower() in ("true", "1", "t")
 TRADE_SIZE_USD = float(os.getenv("TRADE_SIZE_USD", "5.0"))
 MAX_POSITION_USD = float(os.getenv("MAX_POSITION_USD", "20.0")) # Safety default
 
-SHORT_EMA_PERIOD = int(os.getenv("SHORT_EMA_PERIOD", "10"))
-LONG_EMA_PERIOD = int(os.getenv("LONG_EMA_PERIOD", "30"))
+SHORT_EMA_PERIOD = int(os.getenv("SHORT_EMA_PERIOD", "5"))
+LONG_EMA_PERIOD = int(os.getenv("LONG_EMA_PERIOD", "15"))
 
 if not POLYMARKET_API_KEY or not POLYMARKET_API_SECRET or not POLYMARKET_API_PASSPHRASE:
     print("Warning: Polymarket API keys not fully configured in .env.")
