@@ -18,7 +18,7 @@ class BTCStrategy:
         ema = df['price'].ewm(span=periods, adjust=False).mean()
         return ema.iloc[-1]
 
-    def get_trend(self, current_price: float) -> str:
+    def get_trend(self, current_price: float) -> tuple[str, float]:
         """
         Calculates EMA-based momentum using a rolling window of prices.
         """
@@ -28,7 +28,7 @@ class BTCStrategy:
             self.price_history.pop(0)
             
         if len(self.price_history) < LONG_EMA_PERIOD:
-            return "NEUTRAL" # Bootstrapping history
+            return "NEUTRAL", 0.0 # Bootstrapping history
             
         short_ema = self._calculate_ema(self.price_history[-SHORT_EMA_PERIOD:], SHORT_EMA_PERIOD)
         long_ema = self._calculate_ema(self.price_history, LONG_EMA_PERIOD)
@@ -47,7 +47,7 @@ class BTCStrategy:
              logger.info(f"📈 [bold cyan]MOMENTUM SHIFT:[/bold cyan] {self.last_trend} -> {current_trend} (Diff: {diff:.2f})", extra={"markup": True})
              
         self.last_trend = current_trend
-        return current_trend
+        return current_trend, diff
 
     def calculate_safe_maker_price(self, best_bid: float, best_ask: float, tick_size=0.01) -> Optional[float]:
         """
@@ -71,7 +71,7 @@ class BTCStrategy:
             
         return limit_price
         
-    async def evaluate_and_execute(self, pm_client, active_market: dict, oracle_res: dict, orderbook_res: dict, target_token: str, target_side: str):
+    async def evaluate_and_execute(self, pm_client, active_market: dict, oracle_res: dict, orderbook_res: dict, diff: float, target_token: str, target_side: str):
         """
         Determines position handling based on orderbook logic (Take profit, stop loss, bid limits).
         """
@@ -82,10 +82,35 @@ class BTCStrategy:
             logger.warning("Orderbook data invalid or empty. Skipping execution.")
             return
 
+        # 0. Adverse Selection Simulator Processing
+        if DRY_RUN:
+            self.portfolio.process_pending_orders(target_token, best_bid, best_ask)
+
         limit_price = self.calculate_safe_maker_price(best_bid, best_ask)
         if not limit_price: return
         
         existing_positions = self.portfolio.get_positions_for_market(active_market['condition_id'])
+        pending_orders = self.portfolio.pending_orders
+        
+        # Order Manager (Chase the Price)
+        import time
+        for order in list(pending_orders):
+            if order.token_id != target_token:
+                logger.info(f"🔄 Canceling {order.side} maker order: Trend switched.")
+                if DRY_RUN: self.portfolio.cancel_pending(order)
+                else: pm_client.cancel_all_orders()
+                continue
+                
+            # Cancel if price ran away and we've been waiting for > 1.5 seconds
+            if time.time() - order.timestamp > 1.5:
+                if order.action == "BUY" and best_bid > order.limit_price + 0.005:  # Margin for noise
+                    logger.info(f"💨 Order Manager: Canceling staled BUY order at ${order.limit_price:.3f}, Bid ran away to ${best_bid:.3f}")
+                    if DRY_RUN: self.portfolio.cancel_pending(order)
+                    else: pm_client.cancel_all_orders()
+                elif order.action == "SELL" and best_ask < order.limit_price - 0.005:
+                    logger.info(f"💨 Order Manager: Canceling staled SELL order at ${order.limit_price:.3f}, Ask crashed to ${best_ask:.3f}")
+                    if DRY_RUN: self.portfolio.cancel_pending(order)
+                    else: pm_client.cancel_all_orders()
         
         # 1. Position Management
         for pos in existing_positions:
@@ -121,13 +146,23 @@ class BTCStrategy:
                         await pm_client.place_limit_order(pos.token_id, "SELL", sell_limit, pos.num_shares)
         
         # 2. Entry
-        if not any(p.token_id == target_token for p in existing_positions):
+        if not any(p.token_id == target_token for p in existing_positions) and not any(o.token_id == target_token for o in pending_orders):
+            is_taker = False
+            post_only = True
+            
+            # The Taker Hybrid Override
+            if abs(diff) > 0.8:
+                logger.warning(f"🚀 [bold red]MASSIVE MOMENTUM DETECTED (Diff: {diff:.2f}) - ENGAGING TAKER OVERRIDE[/bold red]", extra={"markup": True})
+                is_taker = True
+                post_only = False
+                limit_price = round(best_ask, 3) # Cross the spread aggressively
+
             if DRY_RUN:
-                self.portfolio.execute_buy(active_market['title'], active_market['condition_id'], target_token, target_side, TRADE_SIZE_USD, limit_price, is_taker=False)
+                self.portfolio.execute_buy(active_market['title'], active_market['condition_id'], target_token, target_side, TRADE_SIZE_USD, limit_price, is_taker=is_taker)
             else:
-                logger.info(f"🚀 [bold magenta][LIVE TRADING][/bold magenta] Limit BUY ${TRADE_SIZE_USD} | {target_side} @ ${limit_price:.3f}", extra={"markup": True})
+                logger.info(f"🚀 [bold magenta][LIVE TRADING][/bold magenta] Limit BUY ${TRADE_SIZE_USD} | {target_side} @ ${limit_price:.3f} (Post-Only: {post_only})", extra={"markup": True})
                 pm_client.cancel_all_orders() # Clear deck
                 target_size = round(TRADE_SIZE_USD / limit_price, 2)
-                await pm_client.place_limit_order(target_token, "BUY", limit_price, target_size)
+                await pm_client.place_limit_order(target_token, "BUY", limit_price, target_size, post_only=post_only)
         else:
-             logger.debug(f"🔒 Holding {target_side} position. Waiting...")
+             logger.debug(f"🔒 Holding or Pending {target_side} position. Waiting...")
