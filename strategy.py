@@ -216,9 +216,9 @@ class BTCStrategy:
                 self.stop_cooldowns[pos.condition_id] = time.time()
                 continue
 
-            # 1b. Trend Reversal Stop Loss
+            # 1b. Trend Reversal Stop Loss (Fix: now proportional — 15% of entry price)
             if pos.token_id != target_token:
-                if pos.entry_price - held_bid_d >= D("0.05"):
+                if pos.entry_price - held_bid_d >= pos.entry_price * D("0.15"):
                     sell_limit = held_bid_d.quantize(TICK, rounding=ROUND_DOWN)
                     logger.info(
                         f"💀 [bold red]STOP LOSS[/bold red] Trend Reversed. DUMPING at ${sell_limit}.",
@@ -272,6 +272,8 @@ class BTCStrategy:
                         if order_id:
                             self._track_order(pos.token_id, "SELL", order_id)
                     self.last_sell_prices[pos.token_id] = sell_limit
+                    # Fix: add 10s TP cooldown to prevent immediate re-entry at higher price
+                    self.stop_cooldowns[pos.condition_id] = time.time() - 20  # 30-20=10s (shorter than SL)
 
         # ── 2. Entry ─────────────────────────────────────────────────────
         has_pos = any(p.token_id == target_token for p in existing_positions)
@@ -281,6 +283,11 @@ class BTCStrategy:
             # Fix 3: Stop-loss cooldown check (30s per condition_id)
             cooldown_ts = self.stop_cooldowns.get(active_market["condition_id"], 0)
             if time.time() - cooldown_ts < 30:
+                return
+
+            # Fix: Universal anti-dust floor — no Maker or Taker entry below $0.15 or above $0.85
+            if limit_price < D("0.15") or limit_price > D("0.85"):
+                logger.debug(f"⛔ Entry blocked: price ${limit_price} outside safe zone (0.15-0.85)")
                 return
 
             # Smart Re-Entry Check
