@@ -1,18 +1,14 @@
-"""Main entry point with kill switch, MTM circuit breaker, and clean shutdown.
+"""Main entry point with kill switch, simplified circuit breaker, and clean shutdown.
 
-Fixes applied from audit:
-- C2: Sets config.DRY_RUN module attribute directly, not os.environ
-- H1: cancel_all_orders wrapped in run_in_executor
-- H5: Circuit breaker uses pessimistic mark (0.0) on fetch failure
-- M6: Metrics module wired and daily summary triggered
+Fixes applied for Static Sniper pivot:
+- Circuit breaker uses simplified Portfolio.get_total_equity() (cost-basis).
+- Removed per-tick orderbook overhead for circuit breaker mark-prices.
 """
 import argparse
 import asyncio
 import logging
 import os
-import sys
 import time
-from decimal import Decimal
 from logging.handlers import TimedRotatingFileHandler
 
 from rich.logging import RichHandler
@@ -71,8 +67,6 @@ async def resolver_loop(pm_client, portfolio, resolving_queue):
 
 async def main(mode: str = "dry-run"):
     is_dry = mode in ("dry-run", "staging")
-
-    # C2 fix: Set module attribute directly so all imports of config.DRY_RUN pick it up
     config.DRY_RUN = is_dry
 
     logger.info("--- Starting Async Polymarket BTC Trading Bot ---")
@@ -80,7 +74,7 @@ async def main(mode: str = "dry-run"):
     logger.info(f"DRY_RUN = {config.DRY_RUN}")
 
     portfolio = Portfolio()
-    metrics = Metrics()  # M6 fix: wire metrics
+    metrics = Metrics()
 
     try:
         pm_client = AsyncPMClient()
@@ -110,48 +104,33 @@ async def main(mode: str = "dry-run"):
 
     tick_interval = 0.5
     last_summary_time = time.time()
-    SUMMARY_INTERVAL = 3600  # hourly summary
+    SUMMARY_INTERVAL = 3600
 
     try:
         while True:
-            # ── Kill switch ──────────────────────────────────────────────
             if _check_kill_switch():
-                logger.error(
-                    "🛑 [bold red]STOP_TRADING file detected. Halting immediately.[/bold red]",
-                    extra={"markup": True},
-                )
+                logger.error("🛑 [bold red]STOP_TRADING file detected.[/bold red]", extra={"markup": True})
                 portfolio.cancel_all_pending()
                 if not is_dry:
-                    await pm_client.cancel_all_orders_async()  # H1 fix
+                    await pm_client.cancel_all_orders_async()
                 break
 
             try:
-                # ── MTM Circuit Breaker (H5 fix: pessimistic on failure) ──
-                mark_prices = {}
-                for pos in portfolio.open_positions:
-                    try:
-                        book = await pm_client.fetch_orderbook(pos.token_id)
-                        mark_prices[pos.token_id] = Decimal(str(book.get("bid", 0)))
-                    except Exception:
-                        # H5 fix: assume worst case, not cost basis
-                        mark_prices[pos.token_id] = Decimal("0")
-                        logger.warning(f"⚠️ Orderbook fetch failed for {pos.token_id[:8]}. Using mark=0.")
-
-                equity = portfolio.get_total_equity(mark_prices)
-                drawdown = equity - portfolio.initial_capacity
+                # ── Circuit Breaker (Static Sniper: Simplified Cost Basis) ──
+                drawdown = portfolio.get_total_equity() - portfolio.initial_capacity
 
                 if drawdown <= -CIRCUIT_BREAKER_USD:
                     logger.error(
-                        f"🚨 [bold red]CIRCUIT BREAKER[/bold red]: MTM equity drawdown "
+                        f"🚨 [bold red]CIRCUIT BREAKER[/bold red]: Equity drawdown "
                         f"${drawdown} exceeds -${CIRCUIT_BREAKER_USD}. Halting.",
                         extra={"markup": True},
                     )
                     metrics.inc("circuit_breaker_trips")
                     if not is_dry:
-                        await pm_client.cancel_all_orders_async()  # H1 fix
+                        await pm_client.cancel_all_orders_async()
                     break
 
-                # ── Oracle ───────────────────────────────────────────────
+                # ── Oracle ──
                 oracle_res = await oracle.fetch_price()
                 price = oracle_res["price"]
 
@@ -160,7 +139,7 @@ async def main(mode: str = "dry-run"):
                     await asyncio.sleep(tick_interval)
                     continue
 
-                # ── Market rollover ──────────────────────────────────────
+                # ── Market rollover ──
                 if time.time() >= active_market.get("expires_at", 0):
                     logger.info("Market expired. Appending to resolution queue...")
                     resolving_queue[active_market["slug"]] = active_market["condition_id"]
@@ -177,7 +156,7 @@ async def main(mode: str = "dry-run"):
                         await asyncio.sleep(5)
                         continue
 
-                # ── Trend ────────────────────────────────────────────────
+                # ── Trend ──
                 trend, diff = strategy.get_trend(price)
 
                 if trend == "NEUTRAL":
@@ -185,23 +164,22 @@ async def main(mode: str = "dry-run"):
                     continue
 
                 logger.info(
-                    f"🔮 Oracle: [bold cyan]${price:,.2f}[/bold cyan] ({oracle_res['source']}) | "
-                    f"Trend: {trend} | Diff: {diff:.2f}",
+                    f"🔮 Oracle: [bold cyan]${price:,.2f}[/bold cyan] | Trend: {trend} | Diff: {diff:.2f}",
                     extra={"markup": True},
                 )
 
                 target_token = active_market["yes_token"] if trend == "UP" else active_market["no_token"]
                 target_side = "YES (UP)" if trend == "UP" else "NO (DOWN)"
 
-                # ── Orderbook ────────────────────────────────────────────
+                # ── Orderbook ──
                 book = await pm_client.fetch_orderbook(target_token)
 
-                # ── Strategy ─────────────────────────────────────────────
+                # ── Strategy ──
                 await strategy.evaluate_and_execute(
                     pm_client, active_market, oracle_res, book, diff, target_token, target_side,
                 )
 
-                # ── Periodic summary (M6 fix) ────────────────────────────
+                # ── Summary ──
                 if time.time() - last_summary_time > SUMMARY_INTERVAL:
                     path = metrics.write_daily_summary()
                     if path:
@@ -218,11 +196,7 @@ async def main(mode: str = "dry-run"):
 
     finally:
         logger.info("Cleaning up...")
-        # Final summary
         path = metrics.write_daily_summary()
-        if path:
-            logger.info(f"📊 Final summary: {path}")
-
         resolver_task.cancel()
         try:
             await resolver_task
@@ -235,12 +209,7 @@ async def main(mode: str = "dry-run"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Polymarket BTC Bot")
-    parser.add_argument(
-        "--mode",
-        choices=["dry-run", "staging", "live"],
-        default="dry-run",
-        help="Operating mode",
-    )
+    parser.add_argument("--mode", choices=["dry-run", "staging", "live"], default="dry-run")
     args = parser.parse_args()
 
     try:

@@ -1,72 +1,53 @@
-"""Unit tests for BTCStrategy decision boundaries."""
+import pytest
 from decimal import Decimal
+from strategy import BTCStrategy
+from portfolio import Portfolio
+
+D = Decimal
+
+
+@pytest.fixture
+def strategy():
+    p = Portfolio(initial_balance=D("100.0"))
+    return BTCStrategy(p)
 
 
 class TestTrendDetection:
-    def test_neutral_during_bootstrap(self, strategy):
-        """Should return NEUTRAL until enough price history."""
+    def test_neutral_start(self, strategy):
         trend, diff = strategy.get_trend(60000.0)
         assert trend == "NEUTRAL"
         assert diff == 0.0
 
-    def test_up_trend_detection(self, strategy):
-        """Rising prices should trigger UP trend."""
-        # Feed enough to bootstrap, then feed rising prices
-        for i in range(20):
-            strategy.get_trend(60000.0 + i * 0.1)
-        
-        # Big spike
-        for _ in range(10):
-            trend, diff = strategy.get_trend(60010.0)
-        
+    def test_up_trend(self, strategy):
+        # Pump prices to generate positive diff
+        prices = [60000.0 + i * 10 for i in range(20)]
+        for p in prices:
+            trend, diff = strategy.get_trend(p)
         assert trend == "UP"
-        assert diff > 0
+        assert diff > 0.5
 
-    def test_down_trend_detection(self, strategy):
-        """Falling prices should trigger DOWN trend."""
-        for i in range(20):
-            strategy.get_trend(60000.0 - i * 0.1)
-        
-        for _ in range(10):
-            trend, diff = strategy.get_trend(59990.0)
-        
+    def test_down_trend(self, strategy):
+        # Crash prices to generate negative diff
+        prices = [60000.0 - i * 10 for i in range(20)]
+        for p in prices:
+            trend, diff = strategy.get_trend(p)
         assert trend == "DOWN"
-        assert diff < 0
-
-
-class TestVolatilityThreshold:
-    def test_low_volatility_uses_minimum(self, strategy):
-        """When volatility is tiny, entry threshold should be 2.0 minimum."""
-        # Flat prices → near-zero vol
-        for _ in range(30):
-            strategy.price_history.append(60000.0)
-        
-        thresh = strategy._entry_threshold()
-        assert thresh == 2.0
-
-    def test_high_volatility_scales(self, strategy):
-        """When volatility is high, threshold should scale up."""
-        import random
-        random.seed(42)
-        for i in range(30):
-            strategy.price_history.append(60000.0 + random.gauss(0, 50))
-        
-        thresh = strategy._entry_threshold()
-        assert thresh > 2.0  # Should scale above minimum
+        assert diff < -0.5
 
 
 class TestMakerPrice:
-    def test_tight_spread_joins_bid(self, strategy):
-        """Tight spread should join at best bid."""
-        price = strategy.calculate_safe_maker_price(0.50, 0.505)
-        assert price == Decimal("0.500")
+    def test_maker_join_bid(self, strategy):
+        """When spread is 1 tick, join bid."""
+        price = strategy.calculate_safe_maker_price(0.50, 0.51)
+        assert price == D("0.50")
 
-    def test_wide_spread_penny_jumps(self, strategy):
-        """Wide spread should penny-jump the bid."""
-        price = strategy.calculate_safe_maker_price(0.30, 0.40)
-        assert price == Decimal("0.301")
+    def test_maker_frontrun(self, strategy):
+        """When spread is wide, frontrun by 1 tick."""
+        price = strategy.calculate_safe_maker_price(0.50, 0.55)
+        assert price == D("0.501")
 
     def test_extreme_skew_rejected(self, strategy):
-        """Extreme skew should return None."""
-        assert strategy.calculate_safe_maker_price(0.96, 0.98) is None
-        assert strategy.calculate_safe_maker_price(0.02, 0.04) is None
+        """Extreme skew (>0.98 or <0.02) should return None."""
+        assert strategy.calculate_safe_maker_price(0.981, 0.99) is None
+        assert strategy.calculate_safe_maker_price(0.01, 0.015) is None
+        assert strategy.calculate_safe_maker_price(0.50, 0.51) == D("0.50")

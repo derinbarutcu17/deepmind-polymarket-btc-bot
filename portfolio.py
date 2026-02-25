@@ -150,15 +150,11 @@ class Portfolio:
 
     # ── MTM ──────────────────────────────────────────────────────────────
 
-    def get_total_equity(self, mark_prices: Optional[Dict[str, Decimal]] = None) -> Decimal:
-        """Return balance + mark-to-market value of open positions."""
+    def get_total_equity(self) -> Decimal:
+        """Return balance + cost basis of open positions. Simplified for Static Sniper."""
         equity = self.balance
         for pos in self.open_positions:
-            if mark_prices and pos.token_id in mark_prices:
-                mark = D(str(mark_prices[pos.token_id]))
-            else:
-                mark = pos.entry_price  # fallback to cost basis
-            equity += pos.num_shares * mark
+            equity += pos.amount_usd
         return equity
 
     # ── BUY ──────────────────────────────────────────────────────────────
