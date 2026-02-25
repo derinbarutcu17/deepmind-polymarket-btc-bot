@@ -97,8 +97,9 @@ class BTCStrategy:
         else:
             limit_price = (D(str(best_bid)) + TICK).quantize(TICK, rounding=ROUND_DOWN)
 
-        # Skew Protection: Don't buy the absolute top or bottom (now 0.02-0.98)
-        if limit_price > D("0.98") or limit_price < D("0.02"):
+        # Skew Protection: Don't buy the absolute top or bottom
+        # Maker trades allowed in 0.05-0.95 range (captures the "meat" of moves)
+        if limit_price > D("0.95") or limit_price < D("0.05"):
             return None
 
         return limit_price
@@ -300,6 +301,15 @@ class BTCStrategy:
                 post_only = False
                 # Taker buy at Best Ask
                 limit_price = D(str(best_ask)).quantize(TICK, rounding=ROUND_DOWN)
+
+                # ANTI-DUST: Only snipe the "Fat Pitch" — never buy lottery tickets
+                if limit_price < D("0.15") or limit_price > D("0.85"):
+                    logger.warning(
+                        f"🚫 [bold yellow]SNIPER BLOCKED[/bold yellow] Price ${limit_price} is outside safe snipe zone (0.15-0.85).",
+                        extra={"markup": True},
+                    )
+                    return
+
                 trade_size_usd = min(TRADE_SIZE_USD * 4, MAX_POSITION_USD)
             else:
                 trade_size_usd = TRADE_SIZE_USD
