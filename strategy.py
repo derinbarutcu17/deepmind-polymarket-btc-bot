@@ -32,6 +32,8 @@ class BTCStrategy:
         # token_id -> {side: order_id} to track multiple orders per token
         self.live_orders: dict[str, dict[str, str]] = {}
         self._ema_cache: dict[int, float] = {}  # period -> last EMA value
+        # Fix 3: Cooldown map — condition_id -> timestamp of last stop-loss
+        self.stop_cooldowns: dict[str, float] = {}
 
     # ── EMA (Optimized Manual Recurrence) ────────────────────────────────
 
@@ -172,15 +174,16 @@ class BTCStrategy:
                     await self._cancel_token_orders(pm_client, order.token_id)
                 continue
 
-            if time.time() - order.timestamp > 1.5:
-                # 0.5% (5 ticks) offset for chasing
+            if time.time() - order.timestamp > 1.5:  # BUY chase: 1.5s
                 if order.action == "BUY" and best_bid > float(order.limit_price) + 0.005:
                     logger.info(f"💨 Chase: Canceling staled BUY at ${order.limit_price}")
                     if is_dry:
                         self.portfolio.cancel_pending(order)
                     else:
                         await self._cancel_token_orders(pm_client, order.token_id, "BUY")
-                elif order.action == "SELL" and best_ask < float(order.limit_price) - 0.005:
+            # Fix 2: SELL chase extended to 15s to give TP orders time to fill
+            if time.time() - order.timestamp > 15.0:
+                if order.action == "SELL" and best_ask < float(order.limit_price) - 0.005:
                     logger.info(f"💨 Chase: Canceling staled SELL at ${order.limit_price}")
                     if is_dry:
                         self.portfolio.cancel_pending(order)
@@ -194,8 +197,8 @@ class BTCStrategy:
             held_ask = held_book.get("ask", 1.0)
             held_bid_d = D(str(held_bid))
 
-            # 1a. Hard 15% Price Crash Stop Loss
-            if held_bid_d < pos.entry_price * D("0.85"):
+            # 1a. Hard 20% Price Crash Stop Loss (Fix 4: widened from 15% → 20%)
+            if held_bid_d < pos.entry_price * D("0.80"):
                 sell_limit = held_bid_d.quantize(TICK, rounding=ROUND_DOWN)
                 logger.info(
                     f"💀 [bold red]HARD STOP LOSS[/bold red] Price Crashed. DUMPING at ${sell_limit}.",
@@ -209,6 +212,8 @@ class BTCStrategy:
                         pos.token_id, "SELL", float(sell_limit), float(pos.num_shares), post_only=False,
                     )
                 self.last_sell_prices[pos.token_id] = sell_limit
+                # Fix 3: record cooldown on condition_id
+                self.stop_cooldowns[pos.condition_id] = time.time()
                 continue
 
             # 1b. Trend Reversal Stop Loss
@@ -227,6 +232,8 @@ class BTCStrategy:
                             pos.token_id, "SELL", float(sell_limit), float(pos.num_shares), post_only=False,
                         )
                     self.last_sell_prices[pos.token_id] = sell_limit
+                    # Fix 3: record cooldown on condition_id
+                    self.stop_cooldowns[pos.condition_id] = time.time()
                     continue
 
             # 1c. Take Profit
@@ -244,6 +251,13 @@ class BTCStrategy:
                 profit_margin = ((sell_limit - pos.entry_price) / pos.entry_price) - fee_offset
 
                 if profit_margin >= D("0.03"):  # 3% Net Profit Target
+                    # Fix 1: Duplicate TP guard — skip if a SELL already pending for this position
+                    already_has_tp = any(
+                        o.action == "SELL" and o.token_id == pos.token_id
+                        for o in pending_orders
+                    )
+                    if already_has_tp:
+                        continue
                     logger.info(
                         f"💰 [bold green]TAKE PROFIT[/bold green] (+{float(profit_margin*100):.1f}%). Limit Sell: ${sell_limit}",
                         extra={"markup": True},
@@ -264,6 +278,11 @@ class BTCStrategy:
         has_pending = any(o.token_id == target_token for o in pending_orders)
 
         if not has_pos and not has_pending:
+            # Fix 3: Stop-loss cooldown check (30s per condition_id)
+            cooldown_ts = self.stop_cooldowns.get(active_market["condition_id"], 0)
+            if time.time() - cooldown_ts < 30:
+                return
+
             # Smart Re-Entry Check
             if target_token in self.last_sell_prices:
                 if limit_price > self.last_sell_prices[target_token]:
