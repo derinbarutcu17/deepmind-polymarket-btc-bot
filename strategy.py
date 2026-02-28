@@ -109,7 +109,8 @@ class BTCStrategy:
         else:
             limit_price = (D(str(best_bid)) + TICK).quantize(TICK, rounding=ROUND_DOWN)
 
-        if limit_price > D("0.95") or limit_price < D("0.05"):
+        if limit_price > D("0.92") or limit_price < D("0.05"):
+            logger.info(f"⛔ GATE 2: Price zone blocked (bid={best_bid:.3f}, ask={best_ask:.3f}) — token OTM or deeply ITM")
             return None
 
         return limit_price
@@ -179,8 +180,8 @@ class BTCStrategy:
                     await self._cancel_token_orders(pm_client, order.token_id)
                 continue
 
-            if time.time() - order.timestamp > 1.5:
-                if order.action == "BUY" and best_bid > float(order.limit_price) + 0.005:
+            if time.time() - order.timestamp > 4.0:
+                if order.action == "BUY" and best_bid > float(order.limit_price) + 0.02:
                     logger.info(f"💨 Chase: Canceling staled BUY at ${order.limit_price}")
                     if is_dry:
                         self.portfolio.cancel_pending(order)
@@ -206,11 +207,17 @@ class BTCStrategy:
             held_ask = held_book.get("ask", 1.0)
             held_bid_d = D(str(held_bid))
 
-            # 1a. Hard 20% Price Crash Stop Loss
-            if held_bid_d < pos.entry_price * D("0.80"):
+            # Minimum hold time: don't fire any stop for 15s after fill.
+            # The first few seconds after entry are noisy; stops firing in <5s
+            # caused most of our losses.
+            hold_secs = time.time() - pos.entry_time if hasattr(pos, 'entry_time') else 999
+            held_mid_d = (held_bid_d + D(str(held_ask))) / D("2")
+
+            # 1a. Hard 30% Price Crash Stop Loss (uses mid, not raw bid)
+            if hold_secs > 15 and held_mid_d < pos.entry_price * D("0.70"):
                 sell_limit = held_bid_d.quantize(TICK, rounding=ROUND_DOWN)
                 logger.info(
-                    f"💀 [bold red]HARD STOP LOSS[/bold red] Price Crashed. DUMPING at ${sell_limit}.",
+                    f"💀 [bold red]HARD STOP LOSS[/bold red] Price Crashed. Mid=${float(held_mid_d):.3f} vs entry=${float(pos.entry_price):.3f}. DUMPING at ${sell_limit}.",
                     extra={"markup": True},
                 )
                 if is_dry:
@@ -229,9 +236,9 @@ class BTCStrategy:
                 self.stop_cooldowns[pos.condition_id] = time.time()
                 continue
 
-            # 1b. Trend Reversal Stop Loss (proportional — 15% of entry price)
-            if pos.token_id != target_token:
-                if pos.entry_price - held_bid_d >= pos.entry_price * D("0.15"):
+            # 1b. Trend Reversal Stop Loss — 30% drop from entry (uses mid price)
+            if pos.token_id != target_token and hold_secs > 15:
+                if pos.entry_price - held_mid_d >= pos.entry_price * D("0.30"):
                     sell_limit = held_bid_d.quantize(TICK, rounding=ROUND_DOWN)
                     logger.info(
                         f"💀 [bold red]STOP LOSS[/bold red] Trend Reversed. DUMPING at ${sell_limit}.",
@@ -293,7 +300,7 @@ class BTCStrategy:
                             )
                             if order_id:
                                 self._track_order(pos.token_id, "SELL", order_id)
-                    self.last_sell_prices[pos.token_id] = sell_limit
+                    # TP: don't poison last_sell_prices — allow re-entry if trend continues
                     self.stop_cooldowns[pos.condition_id] = time.time() - 20  # 10s TP cooldown
 
         # ── 2. Entry ─────────────────────────────────────────────────────
@@ -302,21 +309,38 @@ class BTCStrategy:
 
         if not has_pos and not has_pending:
             cooldown_ts = self.stop_cooldowns.get(active_market["condition_id"], 0)
-            if time.time() - cooldown_ts < 30:
+            remaining = 30 - (time.time() - cooldown_ts)
+            if remaining > 0:
+                logger.info(f"⛔ GATE 3: Cooldown active — {remaining:.0f}s remaining")
                 return
 
-            if limit_price < D("0.15") or limit_price > D("0.85"):
-                logger.debug(f"⛔ Entry blocked: price ${limit_price} outside safe zone (0.15-0.85)")
+            # GATE 4: Minimum upside — don't enter if max payout < 25%
+            if limit_price > D("0.75"):
+                logger.info(f"⛔ GATE 4: Low upside — price ${limit_price} leaves < 25% to $1.00")
+                return
+            if limit_price < D("0.10"):
+                logger.info(f"⛔ GATE 4: Deep OTM — price ${limit_price} too cheap")
                 return
 
+            # GATE 4b: Time remaining guard — don't enter dying markets
+            closes_in = active_market.get("closes_in", 300)
+            if closes_in < 90:
+                logger.info(f"⛔ GATE 4b: Market expires in {closes_in}s — too late to enter")
+                return
+
+            # GATE 5: Don't re-enter same token above stop-out price (stops only)
             if target_token in self.last_sell_prices:
                 if limit_price > self.last_sell_prices[target_token]:
+                    logger.info(f"⛔ GATE 5: Re-entry blocked — ${limit_price} > last stop ${self.last_sell_prices[target_token]}")
                     return
 
             if abs(diff) < 1.0:
+                logger.info(f"⛔ GATE 6: Momentum too weak — diff={diff:.2f} (need >=1.0)")
                 return
 
-            if (best_ask - best_bid) > 0.12:
+            spread = best_ask - best_bid
+            if spread > 0.15:
+                logger.info(f"⛔ GATE 7: Spread too wide — {spread:.3f}")
                 return
 
             bids = orderbook_res.get("bids", [])
@@ -331,25 +355,9 @@ class BTCStrategy:
 
             is_taker = False
             post_only = True
-
-            if abs(diff) > 4.0:
-                logger.warning(
-                    f"🚀 [bold red]MASSIVE MOMENTUM (Diff: {diff:.2f})[/bold red]", extra={"markup": True},
-                )
-                is_taker = True
-                post_only = False
-                limit_price = D(str(best_ask)).quantize(TICK, rounding=ROUND_DOWN)
-
-                if limit_price < D("0.15") or limit_price > D("0.85"):
-                    logger.warning(
-                        f"🚫 [bold yellow]SNIPER BLOCKED[/bold yellow] Price ${limit_price} is outside safe snipe zone (0.15-0.85).",
-                        extra={"markup": True},
-                    )
-                    return
-
-                trade_size_usd = min(TRADE_SIZE_USD * 4, MAX_POSITION_USD)
-            else:
-                trade_size_usd = TRADE_SIZE_USD
+            # TAKER SNIPER DISABLED: was buying at market price during extreme
+            # moves, consistently entering at the worst price and losing 20-30%.
+            trade_size_usd = TRADE_SIZE_USD
 
             current_exposure = sum(p.amount_usd for p in self.portfolio.open_positions)
             if current_exposure + trade_size_usd > MAX_POSITION_USD:

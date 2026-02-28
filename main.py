@@ -208,6 +208,7 @@ async def main(mode: str = "dry-run"):
                 book = await pm_client.fetch_orderbook(target_token)
 
                 # ── Strategy ──────────────────────────────────────────────
+                active_market["closes_in"] = max(0, active_market.get("expires_at", 0) - time.time())
                 await strategy.evaluate_and_execute(
                     pm_client, active_market, oracle_res, book, diff, target_token, target_side,
                 )
