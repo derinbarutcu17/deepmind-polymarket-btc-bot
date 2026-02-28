@@ -4,7 +4,15 @@ Key Features:
 - Replaces dynamic volatility scaling with fixed, responsive thresholds.
 - Streamlined Maker/Taker logic based on EMA momentum (diff).
 - Conservative re-entry protection and OFI volume-intensity filtering.
+
+Production upgrades:
+- Per-token asyncio.Lock: each execution block (entry, TP, SL) acquires the
+  token's lock before any awaited API call, so a lagging network response
+  from tick N cannot race with tick N+1 for the same token.
+- Decimal-string coercion: place_limit_order receives price and size as
+  properly quantized Decimal strings — no float() precision loss.
 """
+import asyncio
 import logging
 import time
 import config
@@ -21,6 +29,7 @@ logger = logging.getLogger(__name__)
 D = Decimal
 ZERO = D("0")
 TICK = D("0.001")
+SIZE_TICK = D("0.01")
 
 
 class BTCStrategy:
@@ -32,8 +41,14 @@ class BTCStrategy:
         # token_id -> {side: order_id} to track multiple orders per token
         self.live_orders: dict[str, dict[str, str]] = {}
         self._ema_cache: dict[int, float] = {}  # period -> last EMA value
-        # Fix 3: Cooldown map — condition_id -> timestamp of last stop-loss
         self.stop_cooldowns: dict[str, float] = {}
+        # Per-token execution locks — prevent duplicate orders during network lag
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def _get_lock(self, token_id: str) -> asyncio.Lock:
+        if token_id not in self._locks:
+            self._locks[token_id] = asyncio.Lock()
+        return self._locks[token_id]
 
     # ── EMA (Optimized Manual Recurrence) ────────────────────────────────
 
@@ -47,7 +62,6 @@ class BTCStrategy:
             ema = prices[-1] * k + prev_ema * (1 - k)
         else:
             ema = prices[0]
-            # Warmup recalculation if cache missed
             for p in prices[1:]:
                 ema = p * k + ema * (1 - k)
         self._ema_cache[cache_key] = ema
@@ -68,7 +82,6 @@ class BTCStrategy:
 
         diff = short_ema - long_ema
 
-        # Lowered static thresholds for trend detection
         if diff > 0.5:
             current_trend = "UP"
         elif diff < -0.5:
@@ -91,16 +104,11 @@ class BTCStrategy:
         spread = D(str(best_ask)) - D(str(best_bid))
         tick_d = D(str(tick_size))
 
-        # Safe Maker Logic:
-        # If spread is tight (1 tick), join the Bid queue.
-        # If spread is wide, Front-run the Bid by 1 tick.
         if spread <= tick_d:
             limit_price = D(str(best_bid)).quantize(TICK, rounding=ROUND_DOWN)
         else:
             limit_price = (D(str(best_bid)) + TICK).quantize(TICK, rounding=ROUND_DOWN)
 
-        # Skew Protection: Don't buy the absolute top or bottom
-        # Maker trades allowed in 0.05-0.95 range (captures the "meat" of moves)
         if limit_price > D("0.95") or limit_price < D("0.05"):
             return None
 
@@ -153,9 +161,6 @@ class BTCStrategy:
             for tok in pending_tokens:
                 if tok == target_token:
                     self.portfolio.process_pending_orders(tok, best_bid, best_ask)
-                else:
-                    # Fetching only if we have high-velocity tracking
-                    pass
 
         limit_price = self.calculate_safe_maker_price(best_bid, best_ask)
         if not limit_price:
@@ -174,14 +179,13 @@ class BTCStrategy:
                     await self._cancel_token_orders(pm_client, order.token_id)
                 continue
 
-            if time.time() - order.timestamp > 1.5:  # BUY chase: 1.5s
+            if time.time() - order.timestamp > 1.5:
                 if order.action == "BUY" and best_bid > float(order.limit_price) + 0.005:
                     logger.info(f"💨 Chase: Canceling staled BUY at ${order.limit_price}")
                     if is_dry:
                         self.portfolio.cancel_pending(order)
                     else:
                         await self._cancel_token_orders(pm_client, order.token_id, "BUY")
-            # Fix 2: SELL chase extended to 15s to give TP orders time to fill
             if time.time() - order.timestamp > 15.0:
                 if order.action == "SELL" and best_ask < float(order.limit_price) - 0.005:
                     logger.info(f"💨 Chase: Canceling staled SELL at ${order.limit_price}")
@@ -192,12 +196,17 @@ class BTCStrategy:
 
         # ── 1. Position Management ───────────────────────────────────────
         for pos in existing_positions:
+            pos_lock = self._get_lock(pos.token_id)
+            if pos_lock.locked():
+                logger.debug(f"⏭️  pos {pos.token_id[:8]}… locked — skipping tick")
+                continue
+
             held_book = await pm_client.fetch_orderbook(pos.token_id)
             held_bid = held_book.get("bid", 0.0)
             held_ask = held_book.get("ask", 1.0)
             held_bid_d = D(str(held_bid))
 
-            # 1a. Hard 20% Price Crash Stop Loss (Fix 4: widened from 15% → 20%)
+            # 1a. Hard 20% Price Crash Stop Loss
             if held_bid_d < pos.entry_price * D("0.80"):
                 sell_limit = held_bid_d.quantize(TICK, rounding=ROUND_DOWN)
                 logger.info(
@@ -207,16 +216,20 @@ class BTCStrategy:
                 if is_dry:
                     self.portfolio.execute_sell(pos, sell_limit, reason="Hard Stop", is_taker=True)
                 else:
-                    await self._cancel_token_orders(pm_client, pos.token_id)
-                    await pm_client.place_limit_order(
-                        pos.token_id, "SELL", float(sell_limit), float(pos.num_shares), post_only=False,
-                    )
+                    async with pos_lock:
+                        await self._cancel_token_orders(pm_client, pos.token_id)
+                        await pm_client.place_limit_order(
+                            pos.token_id,
+                            "SELL",
+                            str(sell_limit),
+                            str(pos.num_shares.quantize(SIZE_TICK, rounding=ROUND_DOWN)),
+                            post_only=False,
+                        )
                 self.last_sell_prices[pos.token_id] = sell_limit
-                # Fix 3: record cooldown on condition_id
                 self.stop_cooldowns[pos.condition_id] = time.time()
                 continue
 
-            # 1b. Trend Reversal Stop Loss (Fix: now proportional — 15% of entry price)
+            # 1b. Trend Reversal Stop Loss (proportional — 15% of entry price)
             if pos.token_id != target_token:
                 if pos.entry_price - held_bid_d >= pos.entry_price * D("0.15"):
                     sell_limit = held_bid_d.quantize(TICK, rounding=ROUND_DOWN)
@@ -227,12 +240,16 @@ class BTCStrategy:
                     if is_dry:
                         self.portfolio.execute_sell(pos, sell_limit, reason="Stop Loss", is_taker=True)
                     else:
-                        await self._cancel_token_orders(pm_client, pos.token_id)
-                        await pm_client.place_limit_order(
-                            pos.token_id, "SELL", float(sell_limit), float(pos.num_shares), post_only=False,
-                        )
+                        async with pos_lock:
+                            await self._cancel_token_orders(pm_client, pos.token_id)
+                            await pm_client.place_limit_order(
+                                pos.token_id,
+                                "SELL",
+                                str(sell_limit),
+                                str(pos.num_shares.quantize(SIZE_TICK, rounding=ROUND_DOWN)),
+                                post_only=False,
+                            )
                     self.last_sell_prices[pos.token_id] = sell_limit
-                    # Fix 3: record cooldown on condition_id
                     self.stop_cooldowns[pos.condition_id] = time.time()
                     continue
 
@@ -243,15 +260,13 @@ class BTCStrategy:
                 target_ask = best_ask if pos.token_id == target_token else held_ask
                 target_bid = best_bid if pos.token_id == target_token else held_bid
 
-                # Try to Maker Sell at Ask, unless spread is tight
                 raw_sell = target_ask if (target_ask - target_bid) <= 0.01 else (target_ask - 0.001)
                 sell_limit = D(str(raw_sell)).quantize(TICK, rounding=ROUND_DOWN)
 
                 fee_offset = D("0.015") if getattr(pos, "is_taker", False) else ZERO
                 profit_margin = ((sell_limit - pos.entry_price) / pos.entry_price) - fee_offset
 
-                if profit_margin >= D("0.03"):  # 3% Net Profit Target
-                    # Fix 1: Duplicate TP guard — skip if a SELL already pending for this position
+                if profit_margin >= D("0.03"):
                     already_has_tp = any(
                         o.action == "SELL" and o.token_id == pos.token_id
                         for o in pending_orders
@@ -265,45 +280,45 @@ class BTCStrategy:
                     if is_dry:
                         self.portfolio.execute_sell(pos, sell_limit, reason="Take Profit", is_taker=False)
                     else:
-                        await self._cancel_token_orders(pm_client, pos.token_id, "SELL")
-                        order_id = await pm_client.place_limit_order(
-                            pos.token_id, "SELL", float(sell_limit), float(pos.num_shares),
-                        )
-                        if order_id:
-                            self._track_order(pos.token_id, "SELL", order_id)
+                        if pos_lock.locked():
+                            logger.debug(f"⏭️  TP skipped: {pos.token_id[:8]}… lock held")
+                            continue
+                        async with pos_lock:
+                            await self._cancel_token_orders(pm_client, pos.token_id, "SELL")
+                            order_id = await pm_client.place_limit_order(
+                                pos.token_id,
+                                "SELL",
+                                str(sell_limit),
+                                str(pos.num_shares.quantize(SIZE_TICK, rounding=ROUND_DOWN)),
+                            )
+                            if order_id:
+                                self._track_order(pos.token_id, "SELL", order_id)
                     self.last_sell_prices[pos.token_id] = sell_limit
-                    # Fix: add 10s TP cooldown to prevent immediate re-entry at higher price
-                    self.stop_cooldowns[pos.condition_id] = time.time() - 20  # 30-20=10s (shorter than SL)
+                    self.stop_cooldowns[pos.condition_id] = time.time() - 20  # 10s TP cooldown
 
         # ── 2. Entry ─────────────────────────────────────────────────────
         has_pos = any(p.token_id == target_token for p in existing_positions)
         has_pending = any(o.token_id == target_token for o in pending_orders)
 
         if not has_pos and not has_pending:
-            # Fix 3: Stop-loss cooldown check (30s per condition_id)
             cooldown_ts = self.stop_cooldowns.get(active_market["condition_id"], 0)
             if time.time() - cooldown_ts < 30:
                 return
 
-            # Fix: Universal anti-dust floor — no Maker or Taker entry below $0.15 or above $0.85
             if limit_price < D("0.15") or limit_price > D("0.85"):
                 logger.debug(f"⛔ Entry blocked: price ${limit_price} outside safe zone (0.15-0.85)")
                 return
 
-            # Smart Re-Entry Check
             if target_token in self.last_sell_prices:
                 if limit_price > self.last_sell_prices[target_token]:
                     return
 
-            # STATIC Hysteresis (Lowered)
             if abs(diff) < 1.0:
                 return
 
-            # STATIC Spread check (Loosened)
             if (best_ask - best_bid) > 0.12:
                 return
 
-            # Order Flow Intensity (OFI) - Loosened
             bids = orderbook_res.get("bids", [])
             asks = orderbook_res.get("asks", [])
             total_bid_vol = sum(float(b.get("size", 0)) for b in bids)
@@ -314,8 +329,6 @@ class BTCStrategy:
             if ofi < 0.15:
                 return
 
-            # STATIC Taker Threshold
-            # If Diff > 4.0, we take. Otherwise, we make.
             is_taker = False
             post_only = True
 
@@ -325,10 +338,8 @@ class BTCStrategy:
                 )
                 is_taker = True
                 post_only = False
-                # Taker buy at Best Ask
                 limit_price = D(str(best_ask)).quantize(TICK, rounding=ROUND_DOWN)
 
-                # ANTI-DUST: Only snipe the "Fat Pitch" — never buy lottery tickets
                 if limit_price < D("0.15") or limit_price > D("0.85"):
                     logger.warning(
                         f"🚫 [bold yellow]SNIPER BLOCKED[/bold yellow] Price ${limit_price} is outside safe snipe zone (0.15-0.85).",
@@ -340,7 +351,6 @@ class BTCStrategy:
             else:
                 trade_size_usd = TRADE_SIZE_USD
 
-            # Exposure Check
             current_exposure = sum(p.amount_usd for p in self.portfolio.open_positions)
             if current_exposure + trade_size_usd > MAX_POSITION_USD:
                 return
@@ -351,14 +361,25 @@ class BTCStrategy:
                     target_token, target_side, trade_size_usd, limit_price, is_taker=is_taker,
                 )
             else:
-                logger.info(
-                    f"🚀 [bold magenta]LIVE BUY[/bold magenta] ${trade_size_usd} {target_side} @ ${limit_price} (Taker: {is_taker})",
-                    extra={"markup": True},
-                )
-                await self._cancel_token_orders(pm_client, target_token, "BUY")
-                target_size = float((trade_size_usd / limit_price).quantize(D("0.01"), rounding=ROUND_DOWN))
-                order_id = await pm_client.place_limit_order(
-                    target_token, "BUY", float(limit_price), target_size, post_only=post_only,
-                )
-                if order_id:
-                    self._track_order(target_token, "BUY", order_id)
+                entry_lock = self._get_lock(target_token)
+                if entry_lock.locked():
+                    logger.debug(f"⏭️  Entry skipped: {target_token[:8]}… lock held")
+                    return
+                async with entry_lock:
+                    logger.info(
+                        f"🚀 [bold magenta]LIVE BUY[/bold magenta] ${trade_size_usd} {target_side} @ ${limit_price} (Taker: {is_taker})",
+                        extra={"markup": True},
+                    )
+                    await self._cancel_token_orders(pm_client, target_token, "BUY")
+                    entry_size = str(
+                        (trade_size_usd / limit_price).quantize(SIZE_TICK, rounding=ROUND_DOWN)
+                    )
+                    order_id = await pm_client.place_limit_order(
+                        target_token,
+                        "BUY",
+                        str(limit_price),
+                        entry_size,
+                        post_only=post_only,
+                    )
+                    if order_id:
+                        self._track_order(target_token, "BUY", order_id)
