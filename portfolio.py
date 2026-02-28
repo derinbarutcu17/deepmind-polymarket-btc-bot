@@ -86,6 +86,7 @@ class Position:
             else ZERO
         )
         self.is_taker = is_taker
+        self.entry_time = time.time()
 
     def __repr__(self):
         return (

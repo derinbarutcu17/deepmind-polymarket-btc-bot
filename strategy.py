@@ -109,13 +109,8 @@ class BTCStrategy:
         else:
             limit_price = (D(str(best_bid)) + TICK).quantize(TICK, rounding=ROUND_DOWN)
 
-        # Block deeply out-of-the-money (worthless) tokens — < $0.05 means near zero chance
-        if limit_price < D("0.05"):
-            return None
-
-        # Block deeply in-the-money tokens — > $0.92 means less than 8% upside to $1.00,
-        # not worth the volatility risk for a short-term trade
-        if limit_price > D("0.92"):
+        if limit_price > D("0.92") or limit_price < D("0.05"):
+            logger.info(f"⛔ GATE 2: Price zone blocked (bid={best_bid:.3f}, ask={best_ask:.3f}) — token OTM or deeply ITM")
             return None
 
         return limit_price
@@ -159,7 +154,6 @@ class BTCStrategy:
         best_ask = orderbook_res.get("ask", 1.0)
 
         if best_bid == 0.0 and best_ask == 1.0:
-            logger.info("⛔ GATE 1: Orderbook empty (bid=0, ask=1) — WS cache not seeded yet or REST failed.")
             return
 
         # Adverse Selection Simulator (Dry Run Only)
@@ -171,7 +165,6 @@ class BTCStrategy:
 
         limit_price = self.calculate_safe_maker_price(best_bid, best_ask)
         if not limit_price:
-            logger.info(f"⛔ GATE 2: Price zone blocked (bid={best_bid:.3f}, ask={best_ask:.3f}) — token OTM or deeply ITM")
             return
 
         existing_positions = self.portfolio.get_positions_for_market(active_market["condition_id"])
@@ -189,7 +182,7 @@ class BTCStrategy:
 
             if time.time() - order.timestamp > 4.0:
                 if order.action == "BUY" and best_bid > float(order.limit_price) + 0.02:
-                    logger.info(f"💨 Chase: Canceling staled BUY at ${order.limit_price} (bid moved to {best_bid:.3f})")
+                    logger.info(f"💨 Chase: Canceling staled BUY at ${order.limit_price}")
                     if is_dry:
                         self.portfolio.cancel_pending(order)
                     else:
@@ -214,14 +207,17 @@ class BTCStrategy:
             held_ask = held_book.get("ask", 1.0)
             held_bid_d = D(str(held_bid))
 
-            # 1a. Hard Stop Loss — use MID price to avoid bid-ask spread noise
-            # The spread on thin books can be 5-10 cents; using raw bid caused
-            # immediate stop-outs on the tick after entry. Mid = (bid+ask)/2.
+            # Minimum hold time: don't fire any stop for 15s after fill.
+            # The first few seconds after entry are noisy; stops firing in <5s
+            # caused most of our losses.
+            hold_secs = time.time() - pos.entry_time if hasattr(pos, 'entry_time') else 999
             held_mid_d = (held_bid_d + D(str(held_ask))) / D("2")
-            if held_mid_d < pos.entry_price * D("0.78"):
-                sell_limit = held_bid_d.quantize(TICK, rounding=ROUND_DOWN)  # still sell at bid
+
+            # 1a. Hard 30% Price Crash Stop Loss (uses mid, not raw bid)
+            if hold_secs > 15 and held_mid_d < pos.entry_price * D("0.70"):
+                sell_limit = held_bid_d.quantize(TICK, rounding=ROUND_DOWN)
                 logger.info(
-                    f"💀 [bold red]HARD STOP LOSS[/bold red] Price Crashed. DUMPING at ${sell_limit}.",
+                    f"💀 [bold red]HARD STOP LOSS[/bold red] Price Crashed. Mid=${float(held_mid_d):.3f} vs entry=${float(pos.entry_price):.3f}. DUMPING at ${sell_limit}.",
                     extra={"markup": True},
                 )
                 if is_dry:
@@ -236,14 +232,13 @@ class BTCStrategy:
                             str(pos.num_shares.quantize(SIZE_TICK, rounding=ROUND_DOWN)),
                             post_only=False,
                         )
-                self.last_sell_prices[pos.token_id] = sell_limit  # block re-entry above stop price
+                self.last_sell_prices[pos.token_id] = sell_limit
                 self.stop_cooldowns[pos.condition_id] = time.time()
                 continue
 
-            # 1b. Trend Reversal Stop Loss — 25% drop from entry (was 15%, too trigger-happy)
-            # Also uses mid price to ignore spread noise.
-            if pos.token_id != target_token:
-                if pos.entry_price - held_mid_d >= pos.entry_price * D("0.25"):
+            # 1b. Trend Reversal Stop Loss — 30% drop from entry (uses mid price)
+            if pos.token_id != target_token and hold_secs > 15:
+                if pos.entry_price - held_mid_d >= pos.entry_price * D("0.30"):
                     sell_limit = held_bid_d.quantize(TICK, rounding=ROUND_DOWN)
                     logger.info(
                         f"💀 [bold red]STOP LOSS[/bold red] Trend Reversed. DUMPING at ${sell_limit}.",
@@ -261,7 +256,7 @@ class BTCStrategy:
                                 str(pos.num_shares.quantize(SIZE_TICK, rounding=ROUND_DOWN)),
                                 post_only=False,
                             )
-                    self.last_sell_prices[pos.token_id] = sell_limit  # block re-entry above stop price
+                    self.last_sell_prices[pos.token_id] = sell_limit
                     self.stop_cooldowns[pos.condition_id] = time.time()
                     continue
 
@@ -305,8 +300,7 @@ class BTCStrategy:
                             )
                             if order_id:
                                 self._track_order(pos.token_id, "SELL", order_id)
-                    # TP fill: do NOT record last_sell_prices — allow re-entry if trend continues.
-                    # The TP cooldown (10s) via stop_cooldowns is enough protection.
+                    # TP: don't poison last_sell_prices — allow re-entry if trend continues
                     self.stop_cooldowns[pos.condition_id] = time.time() - 20  # 10s TP cooldown
 
         # ── 2. Entry ─────────────────────────────────────────────────────
@@ -320,20 +314,25 @@ class BTCStrategy:
                 logger.info(f"⛔ GATE 3: Cooldown active — {remaining:.0f}s remaining")
                 return
 
-            # GATE 4: Minimum upside check — don't enter if max payout < 20%.
-            # A token at $0.81 wins $1.00 max = only 23% upside, borderline.
-            # A token at $0.85+ means < 18% upside — not worth the entry risk.
-            if limit_price > D("0.80"):
-                logger.info(f"⛔ GATE 4: Low upside — price ${limit_price} leaves < 20% to $1.00")
+            # GATE 4: Minimum upside — don't enter if max payout < 25%
+            if limit_price > D("0.75"):
+                logger.info(f"⛔ GATE 4: Low upside — price ${limit_price} leaves < 25% to $1.00")
                 return
-            # Also block deeply OTM tokens (< $0.10) — near-zero chance of winning
             if limit_price < D("0.10"):
-                logger.info(f"⛔ GATE 4: Deep OTM — price ${limit_price} too cheap, likely losing token")
+                logger.info(f"⛔ GATE 4: Deep OTM — price ${limit_price} too cheap")
                 return
 
-            # GATE 5 REMOVED: Post-stop re-entry is already handled by the 30s cooldown above.
-            # The old last_sell_prices check was blocking profitable follow-on entries after TP fills.
-            # last_sell_prices is now only set on STOP LOSS exits to prevent buying back into losers.
+            # GATE 4b: Time remaining guard — don't enter dying markets
+            closes_in = active_market.get("closes_in", 300)
+            if closes_in < 90:
+                logger.info(f"⛔ GATE 4b: Market expires in {closes_in}s — too late to enter")
+                return
+
+            # GATE 5: Don't re-enter same token above stop-out price (stops only)
+            if target_token in self.last_sell_prices:
+                if limit_price > self.last_sell_prices[target_token]:
+                    logger.info(f"⛔ GATE 5: Re-entry blocked — ${limit_price} > last stop ${self.last_sell_prices[target_token]}")
+                    return
 
             if abs(diff) < 1.0:
                 logger.info(f"⛔ GATE 6: Momentum too weak — diff={diff:.2f} (need >=1.0)")
@@ -341,7 +340,7 @@ class BTCStrategy:
 
             spread = best_ask - best_bid
             if spread > 0.15:
-                logger.info(f"⛔ GATE 7: Spread too wide — {spread:.3f} (limit=0.15, bid={best_bid:.3f}, ask={best_ask:.3f})")
+                logger.info(f"⛔ GATE 7: Spread too wide — {spread:.3f}")
                 return
 
             bids = orderbook_res.get("bids", [])
@@ -352,14 +351,12 @@ class BTCStrategy:
 
             ofi = total_bid_vol / total_vol if total_vol > 0 else 0.5
             if ofi < 0.15:
-                logger.info(f"⛔ GATE 8: OFI too low — {ofi:.2f} (bid_vol={total_bid_vol:.1f}, ask_vol={total_ask_vol:.1f})")
                 return
 
             is_taker = False
             post_only = True
-            # Taker sniper DISABLED: it was buying extremes (diff>4 = price already moved far)
-            # at 4x size and getting hard-stopped within 2 ticks. Pure capital destruction.
-            # All entries are now calm maker orders at TRADE_SIZE_USD only.
+            # TAKER SNIPER DISABLED: was buying at market price during extreme
+            # moves, consistently entering at the worst price and losing 20-30%.
             trade_size_usd = TRADE_SIZE_USD
 
             current_exposure = sum(p.amount_usd for p in self.portfolio.open_positions)
