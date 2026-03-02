@@ -207,14 +207,13 @@ class BTCStrategy:
             held_ask = held_book.get("ask", 1.0)
             held_bid_d = D(str(held_bid))
 
-            # Minimum hold time: don't fire any stop for 15s after fill.
-            # The first few seconds after entry are noisy; stops firing in <5s
-            # caused most of our losses.
+            # Minimum hold time: don't fire any stop for 3s after fill,
+            # to avoid immediate spread jitter after execution.
             hold_secs = time.time() - pos.entry_time if hasattr(pos, 'entry_time') else 999
             held_mid_d = (held_bid_d + D(str(held_ask))) / D("2")
 
-            # 1a. Hard 30% Price Crash Stop Loss (uses mid, not raw bid)
-            if hold_secs > 15 and held_mid_d < pos.entry_price * D("0.70"):
+            # 1a. Hard 25% Price Crash Stop Loss (uses mid, not raw bid)
+            if hold_secs > 3 and held_mid_d < pos.entry_price * D("0.75"):
                 sell_limit = held_bid_d.quantize(TICK, rounding=ROUND_DOWN)
                 logger.info(
                     f"💀 [bold red]HARD STOP LOSS[/bold red] Price Crashed. Mid=${float(held_mid_d):.3f} vs entry=${float(pos.entry_price):.3f}. DUMPING at ${sell_limit}.",
@@ -236,16 +235,17 @@ class BTCStrategy:
                 self.stop_cooldowns[pos.condition_id] = time.time()
                 continue
 
-            # 1b. Trend Reversal Stop Loss — 30% drop from entry (uses mid price)
-            if pos.token_id != target_token and hold_secs > 15:
-                if pos.entry_price - held_mid_d >= pos.entry_price * D("0.30"):
+            # 1b. Momentum Reversal Exit — Oracle trend violently shifted against us
+            if pos.token_id != target_token and hold_secs > 3:
+                # If diff moves against us by at least 2.5 (e.g. +2.5 when we hold NO, or -2.5 when we hold YES)
+                if abs(diff) >= 2.5:
                     sell_limit = held_bid_d.quantize(TICK, rounding=ROUND_DOWN)
                     logger.info(
-                        f"💀 [bold red]STOP LOSS[/bold red] Trend Reversed. DUMPING at ${sell_limit}.",
+                        f"💀 [bold red]MOMENTUM REVERSAL[/bold red] Trend violently shifted (diff={diff:.2f}). DUMPING at ${sell_limit}.",
                         extra={"markup": True},
                     )
                     if is_dry:
-                        self.portfolio.execute_sell(pos, sell_limit, reason="Stop Loss", is_taker=True)
+                        self.portfolio.execute_sell(pos, sell_limit, reason="Momentum Reversal", is_taker=True)
                     else:
                         async with pos_lock:
                             await self._cancel_token_orders(pm_client, pos.token_id)
