@@ -172,12 +172,12 @@ class BTCStrategy:
 
         # ── Order Manager (Price Chasing) ────────────────────────────────
         for order in list(pending_orders):
-            if order.token_id != target_token:
-                logger.info(f"🔄 Canceling {order.side} maker order: Trend switched.")
+            if order.token_id != target_token and order.action == "BUY":
+                logger.info(f"🔄 Canceling {order.action} {order.side} maker order: Trend switched.")
                 if is_dry:
                     self.portfolio.cancel_pending(order)
                 else:
-                    await self._cancel_token_orders(pm_client, order.token_id)
+                    await self._cancel_token_orders(pm_client, order.token_id, "BUY")
                 continue
 
             if time.time() - order.timestamp > 4.0:
@@ -235,13 +235,14 @@ class BTCStrategy:
                 self.stop_cooldowns[pos.condition_id] = time.time()
                 continue
 
-            # 1b. Momentum Reversal Exit — Oracle trend violently shifted against us
-            if pos.token_id != target_token and hold_secs > 3:
-                # If diff moves against us by at least 2.5 (e.g. +2.5 when we hold NO, or -2.5 when we hold YES)
-                if abs(diff) >= 2.5:
+            # 1b. Momentum Reversal Exit — Oracle trend strongly shifted against us
+            # We don't need hold_secs > 3 because diff comes from Pyth, not the orderbook spread.
+            if pos.token_id != target_token:
+                # If diff moves against us by at least 1.0 (the entry threshold for opponent token)
+                if abs(diff) >= 1.0:
                     sell_limit = held_bid_d.quantize(TICK, rounding=ROUND_DOWN)
                     logger.info(
-                        f"💀 [bold red]MOMENTUM REVERSAL[/bold red] Trend violently shifted (diff={diff:.2f}). DUMPING at ${sell_limit}.",
+                        f"💀 [bold red]MOMENTUM REVERSAL[/bold red] Trend strongly shifted (diff={diff:.2f}). DUMPING at ${sell_limit}.",
                         extra={"markup": True},
                     )
                     if is_dry:
