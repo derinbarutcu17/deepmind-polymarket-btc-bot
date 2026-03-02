@@ -246,10 +246,10 @@ class AsyncPMClient:
 
     async def get_active_market(self):
         curr_ts = int(time.time())
-        current_base = (curr_ts // 300) * 300
+        current_base = (curr_ts // 900) * 900
 
-        for ts in [current_base, current_base + 300, current_base + 600, current_base - 300]:
-            slug = f"btc-updown-5m-{ts}"
+        for ts in [current_base, current_base + 900, current_base + 1800, current_base - 900]:
+            slug = f"btc-updown-15m-{ts}"
             url = f"https://gamma-api.polymarket.com/events?slug={slug}"
             data = await _fetch_with_retry(self._session, url)
 
@@ -266,7 +266,7 @@ class AsyncPMClient:
                 end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
                 seconds_until_close = (end_dt - datetime.now(timezone.utc)).total_seconds()
 
-                if 0 < seconds_until_close < 480:
+                if 0 < seconds_until_close < 1200:
                     tokens = m.get("clobTokenIds")
                     if not tokens:
                         tokens = m.get("tokens", [])

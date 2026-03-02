@@ -17,7 +17,7 @@ import logging
 import time
 import config
 from typing import Optional
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 
 from config import (
     SHORT_EMA_PERIOD, LONG_EMA_PERIOD,
@@ -109,7 +109,7 @@ class BTCStrategy:
         else:
             limit_price = (D(str(best_bid)) + TICK).quantize(TICK, rounding=ROUND_DOWN)
 
-        if limit_price > D("0.92") or limit_price < D("0.05"):
+        if limit_price > D("0.93") or limit_price < D("0.04"):
             logger.info(f"⛔ GATE 2: Price zone blocked (bid={best_bid:.3f}, ask={best_ask:.3f}) — token OTM or deeply ITM")
             return None
 
@@ -212,11 +212,12 @@ class BTCStrategy:
             hold_secs = time.time() - pos.entry_time if hasattr(pos, 'entry_time') else 999
             held_mid_d = (held_bid_d + D(str(held_ask))) / D("2")
 
-            # 1a. Hard 25% Price Crash Stop Loss (uses mid, not raw bid)
-            if hold_secs > 3 and held_mid_d < pos.entry_price * D("0.75"):
-                sell_limit = held_bid_d.quantize(TICK, rounding=ROUND_DOWN)
+            # 1a. Hard $0.08 Price Crash Stop Loss
+            price_drop = pos.entry_price - held_mid_d
+            if hold_secs > 5 and price_drop >= D("0.08"):
+                sell_limit = max(D("0.01"), held_bid_d - D("0.02")).quantize(TICK, rounding=ROUND_DOWN)
                 logger.info(
-                    f"💀 [bold red]HARD STOP LOSS[/bold red] Price Crashed. Mid=${float(held_mid_d):.3f} vs entry=${float(pos.entry_price):.3f}. DUMPING at ${sell_limit}.",
+                    f"💀 [bold red]HARD STOP LOSS[/bold red] Price dropped 8+ cents. Mid=${float(held_mid_d):.3f} vs entry=${float(pos.entry_price):.3f}. Market Selling at ${sell_limit}.",
                     extra={"markup": True},
                 )
                 if is_dry:
@@ -238,11 +239,11 @@ class BTCStrategy:
             # 1b. Momentum Reversal Exit — Oracle trend strongly shifted against us
             # We don't need hold_secs > 3 because diff comes from Pyth, not the orderbook spread.
             if pos.token_id != target_token:
-                # If diff moves against us by at least 1.0 (the entry threshold for opponent token)
-                if abs(diff) >= 1.0:
-                    sell_limit = held_bid_d.quantize(TICK, rounding=ROUND_DOWN)
+                # If diff moves against us by at least 0.8 (earlier intercept of reversal)
+                if abs(diff) >= 0.8:
+                    sell_limit = max(D("0.01"), held_bid_d - D("0.02")).quantize(TICK, rounding=ROUND_DOWN)
                     logger.info(
-                        f"💀 [bold red]MOMENTUM REVERSAL[/bold red] Trend strongly shifted (diff={diff:.2f}). DUMPING at ${sell_limit}.",
+                        f"💀 [bold red]MOMENTUM REVERSAL[/bold red] Trend strongly shifted (diff={diff:.2f}). Market Selling at ${sell_limit}.",
                         extra={"markup": True},
                     )
                     if is_dry:
@@ -261,48 +262,60 @@ class BTCStrategy:
                     self.stop_cooldowns[pos.condition_id] = time.time()
                     continue
 
-            # 1c. Take Profit
-            check_bid_d = D(str(best_bid)) if pos.token_id == target_token else held_bid_d
-
-            if pos.entry_price < check_bid_d:
-                target_ask = best_ask if pos.token_id == target_token else held_ask
-                target_bid = best_bid if pos.token_id == target_token else held_bid
-
-                raw_sell = target_ask if (target_ask - target_bid) <= 0.01 else (target_ask - 0.001)
-                sell_limit = D(str(raw_sell)).quantize(TICK, rounding=ROUND_DOWN)
-
-                fee_offset = D("0.015") if getattr(pos, "is_taker", False) else ZERO
-                profit_margin = ((sell_limit - pos.entry_price) / pos.entry_price) - fee_offset
-
-                if profit_margin >= D("0.03"):
-                    already_has_tp = any(
-                        o.action == "SELL" and o.token_id == pos.token_id
-                        for o in pending_orders
-                    )
-                    if already_has_tp:
-                        continue
+                # 1b-2. Stale Trade Scratch Exit — Trade has stagnated and momentum died
+                elif hold_secs >= 45 and abs(diff) < 0.4:
+                    # Clear it out at the bid to escape the dead money
+                    sell_limit = max(D("0.01"), held_bid_d - D("0.01")).quantize(TICK, rounding=ROUND_DOWN)
                     logger.info(
-                        f"💰 [bold green]TAKE PROFIT[/bold green] (+{float(profit_margin*100):.1f}%). Limit Sell: ${sell_limit}",
+                        f"⏳ [bold yellow]STALE TRADE SCRATCH[/bold yellow] Held >45s & weak momentum (diff={diff:.2f}). Extricating at ${sell_limit}.",
                         extra={"markup": True},
                     )
                     if is_dry:
-                        self.portfolio.execute_sell(pos, sell_limit, reason="Take Profit", is_taker=False)
+                        self.portfolio.execute_sell(pos, sell_limit, reason="Stale Scratch", is_taker=True)
                     else:
-                        if pos_lock.locked():
-                            logger.debug(f"⏭️  TP skipped: {pos.token_id[:8]}… lock held")
-                            continue
                         async with pos_lock:
-                            await self._cancel_token_orders(pm_client, pos.token_id, "SELL")
-                            order_id = await pm_client.place_limit_order(
+                            await self._cancel_token_orders(pm_client, pos.token_id)
+                            await pm_client.place_limit_order(
                                 pos.token_id,
                                 "SELL",
                                 str(sell_limit),
                                 str(pos.num_shares.quantize(SIZE_TICK, rounding=ROUND_DOWN)),
+                                post_only=False,
                             )
-                            if order_id:
-                                self._track_order(pos.token_id, "SELL", order_id)
-                    # TP: don't poison last_sell_prices — allow re-entry if trend continues
-                    self.stop_cooldowns[pos.condition_id] = time.time() - 20  # 10s TP cooldown
+                    self.last_sell_prices[pos.token_id] = sell_limit
+                    self.stop_cooldowns[pos.condition_id] = time.time()
+                    continue
+
+            # 1c. Queue Take Profit at 10% fixed ratio
+            sell_limit = min(D("0.99"), (pos.entry_price * D("1.10")).quantize(TICK, rounding=ROUND_UP))
+            already_has_tp = any(
+                o.action == "SELL" and o.token_id == pos.token_id
+                for o in pending_orders
+            )
+            
+            if not already_has_tp:
+                logger.info(
+                    f"💰 [bold green]QUEUE TAKE PROFIT[/bold green] (+10%). Limit Sell Maker: ${sell_limit}",
+                    extra={"markup": True},
+                )
+                if is_dry:
+                    self.portfolio.execute_sell(pos, sell_limit, reason="Take Profit", is_taker=False)
+                else:
+                    if pos_lock.locked():
+                        logger.debug(f"⏭️  TP skipped: {pos.token_id[:8]}… lock held")
+                        continue
+                    async with pos_lock:
+                        await self._cancel_token_orders(pm_client, pos.token_id, "SELL")
+                        order_id = await pm_client.place_limit_order(
+                            pos.token_id,
+                            "SELL",
+                            str(sell_limit),
+                            str(pos.num_shares.quantize(SIZE_TICK, rounding=ROUND_DOWN)),
+                            post_only=True
+                        )
+                        if order_id:
+                            self._track_order(pos.token_id, "SELL", order_id)
+                self.stop_cooldowns[pos.condition_id] = time.time() - 20
 
         # ── 2. Entry ─────────────────────────────────────────────────────
         has_pos = any(p.token_id == target_token for p in existing_positions)
@@ -319,8 +332,8 @@ class BTCStrategy:
             if limit_price > D("0.75"):
                 logger.info(f"⛔ GATE 4: Low upside — price ${limit_price} leaves < 25% to $1.00")
                 return
-            if limit_price < D("0.10"):
-                logger.info(f"⛔ GATE 4: Deep OTM — price ${limit_price} too cheap")
+            if limit_price < D("0.35"):
+                logger.info(f"⛔ GATE 4: Deep OTM — price ${limit_price} too cheap (need >= $0.35)")
                 return
 
             # GATE 4b: Time remaining guard — don't enter dying markets
@@ -335,12 +348,12 @@ class BTCStrategy:
                     logger.info(f"⛔ GATE 5: Re-entry blocked — ${limit_price} > last stop ${self.last_sell_prices[target_token]}")
                     return
 
-            if abs(diff) < 1.0:
-                logger.info(f"⛔ GATE 6: Momentum too weak — diff={diff:.2f} (need >=1.0)")
+            if abs(diff) < 0.6:
+                logger.info(f"⛔ GATE 6: Momentum too weak — diff={diff:.2f} (need >=0.6)")
                 return
 
             spread = best_ask - best_bid
-            if spread > 0.15:
+            if spread > 0.05:
                 logger.info(f"⛔ GATE 7: Spread too wide — {spread:.3f}")
                 return
 
