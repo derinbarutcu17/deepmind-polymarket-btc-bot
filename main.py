@@ -193,6 +193,13 @@ async def main(mode: str = "dry-run"):
                 trend, diff = strategy.get_trend(price)
 
                 if trend == "NEUTRAL":
+                    history_len = len(strategy.price_history)
+                    if history_len < config.LONG_EMA_PERIOD:
+                        if history_len % 20 == 0:  # Log every 10 seconds
+                            logger.info(f"⏳ Warming up trend memory: {history_len}/{config.LONG_EMA_PERIOD} ticks collected...")
+                    else:
+                        if history_len % 20 == 0:
+                            logger.info(f"💤 Trend is NEUTRAL (diff < 2.0 bps). Waiting for momentum...")
                     await asyncio.sleep(tick_interval)
                     continue
 

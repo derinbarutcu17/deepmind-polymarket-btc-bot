@@ -25,8 +25,8 @@ TRADE_SIZE_USD = D(os.getenv("TRADE_SIZE_USD", "5.0"))
 MAX_POSITION_USD = D(os.getenv("MAX_POSITION_USD", "20.0"))
 
 # ── Strategy ─────────────────────────────────────────────────────────────
-SHORT_EMA_PERIOD = int(os.getenv("SHORT_EMA_PERIOD", "5"))
-LONG_EMA_PERIOD = int(os.getenv("LONG_EMA_PERIOD", "15"))
+SHORT_EMA_PERIOD = int(os.getenv("SHORT_EMA_PERIOD", "40"))
+LONG_EMA_PERIOD = int(os.getenv("LONG_EMA_PERIOD", "120"))
 VOLATILITY_K = float(os.getenv("VOLATILITY_K", "1.5"))
 
 # ── Risk ─────────────────────────────────────────────────────────────────

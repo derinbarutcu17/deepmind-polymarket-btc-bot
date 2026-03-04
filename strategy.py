@@ -16,6 +16,7 @@ import asyncio
 import logging
 import time
 import config
+from market import PriceBuffer
 from typing import Optional
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 
@@ -42,6 +43,8 @@ class BTCStrategy:
         self.live_orders: dict[str, dict[str, str]] = {}
         self._ema_cache: dict[int, float] = {}  # period -> last EMA value
         self.stop_cooldowns: dict[str, float] = {}
+        # Orderbook cache for Signal Blending
+        self.price_buffers: dict[str, PriceBuffer] = {}
         # Per-token execution locks — prevent duplicate orders during network lag
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -71,7 +74,7 @@ class BTCStrategy:
 
     def get_trend(self, current_price: float) -> tuple[str, float]:
         self.price_history.append(current_price)
-        if len(self.price_history) > 60:
+        if len(self.price_history) > LONG_EMA_PERIOD:
             self.price_history.pop(0)
 
         if len(self.price_history) < LONG_EMA_PERIOD:
@@ -80,18 +83,19 @@ class BTCStrategy:
         short_ema = self._calculate_ema(self.price_history[-SHORT_EMA_PERIOD:], SHORT_EMA_PERIOD)
         long_ema = self._calculate_ema(self.price_history, LONG_EMA_PERIOD)
 
-        diff = short_ema - long_ema
+        # Normalize difference to basis points (1 bps = 0.01%)
+        diff = ((short_ema - long_ema) / long_ema) * 10000
 
-        if diff > 0.5:
+        if diff > 1.2:
             current_trend = "UP"
-        elif diff < -0.5:
+        elif diff < -1.2:
             current_trend = "DOWN"
         else:
             current_trend = "NEUTRAL"
 
         if current_trend != "NEUTRAL" and current_trend != self.last_trend:
             logger.info(
-                f"📈 [bold cyan]MOMENTUM SHIFT:[/bold cyan] {self.last_trend} -> {current_trend} (Diff: {diff:.2f})",
+                f"📈 [bold cyan]MOMENTUM SHIFT:[/bold cyan] {self.last_trend} -> {current_trend} (Diff: {diff:.2f} bps)",
                 extra={"markup": True},
             )
 
@@ -170,7 +174,7 @@ class BTCStrategy:
         existing_positions = self.portfolio.get_positions_for_market(active_market["condition_id"])
         pending_orders = self.portfolio.pending_orders
 
-        # ── Order Manager (Price Chasing) ────────────────────────────────
+        # ── Order Manager (No Chasing State Machine) ─────────────────────
         for order in list(pending_orders):
             if order.token_id != target_token and order.action == "BUY":
                 logger.info(f"🔄 Canceling {order.action} {order.side} maker order: Trend switched.")
@@ -180,20 +184,13 @@ class BTCStrategy:
                     await self._cancel_token_orders(pm_client, order.token_id, "BUY")
                 continue
 
-            if time.time() - order.timestamp > 4.0:
-                if order.action == "BUY" and best_bid > float(order.limit_price) + 0.02:
-                    logger.info(f"💨 Chase: Canceling staled BUY at ${order.limit_price}")
-                    if is_dry:
-                        self.portfolio.cancel_pending(order)
-                    else:
-                        await self._cancel_token_orders(pm_client, order.token_id, "BUY")
-            if time.time() - order.timestamp > 15.0:
-                if order.action == "SELL" and best_ask < float(order.limit_price) - 0.005:
-                    logger.info(f"💨 Chase: Canceling staled SELL at ${order.limit_price}")
-                    if is_dry:
-                        self.portfolio.cancel_pending(order)
-                    else:
-                        await self._cancel_token_orders(pm_client, order.token_id, "SELL")
+            # PHASE 1: NO CHASING. HARD 5 SECOND CANCEL ON BUYS.
+            if order.action == "BUY" and time.time() - order.timestamp > 5.0:
+                logger.info(f"⏳ Phase 1 State Shift: Limit BUY older than 5s (${order.limit_price}). Canceling to return to HUNTING.")
+                if is_dry:
+                    self.portfolio.cancel_pending(order)
+                else:
+                    await self._cancel_token_orders(pm_client, order.token_id, "BUY")
 
         # ── 1. Position Management ───────────────────────────────────────
         for pos in existing_positions:
@@ -212,62 +209,88 @@ class BTCStrategy:
             hold_secs = time.time() - pos.entry_time if hasattr(pos, 'entry_time') else 999
             held_mid_d = (held_bid_d + D(str(held_ask))) / D("2")
 
-            # 1a. Hard $0.08 Price Crash Stop Loss
+            # 1a. Hard $0.10 Price Crash Stop Loss (Phase 3 Delta Hedge)
             price_drop = pos.entry_price - held_mid_d
-            if hold_secs > 5 and price_drop >= D("0.08"):
-                sell_limit = max(D("0.01"), held_bid_d - D("0.02")).quantize(TICK, rounding=ROUND_DOWN)
+            if hold_secs > 5 and price_drop >= D("0.10"):
+                opposite_token = active_market['yes_token'] if pos.token_id == active_market['no_token'] else active_market['no_token']
+                opp_book = await pm_client.fetch_orderbook(opposite_token)
+                
+                # FIX: Target the Ask, not the Bid, to ensure we cross the spread on a reversal.
+                opp_ask = opp_book.get("ask", 1.0)
+                
+                # Add 1 cent to the Ask to guarantee a Taker sweep even if the book shifts by milliseconds
+                hedge_limit = (D(str(opp_ask)) + TICK).quantize(TICK, rounding=ROUND_DOWN)
+                effective_exit_price = (D("1.0") - hedge_limit).quantize(TICK, rounding=ROUND_DOWN)
+
                 logger.info(
-                    f"💀 [bold red]HARD STOP LOSS[/bold red] Price dropped 8+ cents. Mid=${float(held_mid_d):.3f} vs entry=${float(pos.entry_price):.3f}. Market Selling at ${sell_limit}.",
+                    f"💀 [bold red]HARD STOP LOSS[/bold red] Price dropped 10+ cents. Executing Delta Hedge! Taker Buying Opposite ID at ${hedge_limit} (Effective Exit: ${effective_exit_price}).",
                     extra={"markup": True},
                 )
                 if is_dry:
-                    self.portfolio.execute_sell(pos, sell_limit, reason="Hard Stop", is_taker=True)
+                    self.portfolio.execute_sell(pos, effective_exit_price, reason="Delta Hedge (Hard Stop)", is_taker=True)
                 else:
                     async with pos_lock:
                         await self._cancel_token_orders(pm_client, pos.token_id)
                         await pm_client.place_limit_order(
-                            pos.token_id,
-                            "SELL",
-                            str(sell_limit),
+                            opposite_token,  
+                            "BUY",
+                            str(hedge_limit),
                             str(pos.num_shares.quantize(SIZE_TICK, rounding=ROUND_DOWN)),
-                            post_only=False,
+                            post_only=False, # FIX: Must be False to act as a Taker
                         )
-                self.last_sell_prices[pos.token_id] = sell_limit
+                        # FIX: Remove the original position from local state so we don't infinite loop
+                        if pos in self.portfolio.open_positions:
+                            self.portfolio.open_positions.remove(pos)
+                            
+                self.last_sell_prices[pos.token_id] = hedge_limit
                 self.stop_cooldowns[pos.condition_id] = time.time()
                 continue
 
             # 1b. Momentum Reversal Exit — Oracle trend strongly shifted against us
             # We don't need hold_secs > 3 because diff comes from Pyth, not the orderbook spread.
             if pos.token_id != target_token:
-                # If diff moves against us by at least 0.8 (earlier intercept of reversal)
-                if abs(diff) >= 0.8:
-                    sell_limit = max(D("0.01"), held_bid_d - D("0.02")).quantize(TICK, rounding=ROUND_DOWN)
+                # If diff moves against us by at least 1.5 bps (solid reversal)
+                if abs(diff) >= 1.5:
+                    opposite_token = active_market['yes_token'] if pos.token_id == active_market['no_token'] else active_market['no_token']
+                    opp_book = await pm_client.fetch_orderbook(opposite_token)
+                    
+                    # FIX: Target the Ask, not the Bid, to ensure we cross the spread on a reversal.
+                    opp_ask = opp_book.get("ask", 1.0)
+                    
+                    # Add 1 cent to the Ask to guarantee a Taker sweep even if the book shifts by milliseconds
+                    hedge_limit = (D(str(opp_ask)) + TICK).quantize(TICK, rounding=ROUND_DOWN)
+                    effective_exit_price = (D("1.0") - hedge_limit).quantize(TICK, rounding=ROUND_DOWN)
+
                     logger.info(
-                        f"💀 [bold red]MOMENTUM REVERSAL[/bold red] Trend strongly shifted (diff={diff:.2f}). Market Selling at ${sell_limit}.",
+                        f"💀 [bold red]MOMENTUM REVERSAL[/bold red] Trend significantly shifted (diff={diff:.2f} bps). Delta Hedging Taker Buy on Opposite Token at ${hedge_limit}.",
                         extra={"markup": True},
                     )
                     if is_dry:
-                        self.portfolio.execute_sell(pos, sell_limit, reason="Momentum Reversal", is_taker=True)
+                        self.portfolio.execute_sell(pos, effective_exit_price, reason="Delta Hedge (Reversal)", is_taker=True)
                     else:
                         async with pos_lock:
                             await self._cancel_token_orders(pm_client, pos.token_id)
                             await pm_client.place_limit_order(
-                                pos.token_id,
-                                "SELL",
-                                str(sell_limit),
+                                opposite_token,
+                                "BUY",
+                                str(hedge_limit),
                                 str(pos.num_shares.quantize(SIZE_TICK, rounding=ROUND_DOWN)),
-                                post_only=False,
+                                post_only=False, # FIX: Must be False to act as a Taker
                             )
-                    self.last_sell_prices[pos.token_id] = sell_limit
+                            # FIX: Remove the original position from local state so we don't infinite loop
+                            if pos in self.portfolio.open_positions:
+                                self.portfolio.open_positions.remove(pos)
+                                
+                    self.last_sell_prices[pos.token_id] = hedge_limit
                     self.stop_cooldowns[pos.condition_id] = time.time()
                     continue
 
                 # 1b-2. Stale Trade Scratch Exit — Trade has stagnated and momentum died
-                elif hold_secs >= 45 and abs(diff) < 0.4:
+                elif hold_secs >= 45 and abs(diff) < 1.0:
                     # Clear it out at the bid to escape the dead money
                     sell_limit = max(D("0.01"), held_bid_d - D("0.01")).quantize(TICK, rounding=ROUND_DOWN)
                     logger.info(
-                        f"⏳ [bold yellow]STALE TRADE SCRATCH[/bold yellow] Held >45s & weak momentum (diff={diff:.2f}). Extricating at ${sell_limit}.",
+                        f"⏳ [bold yellow]STALE TRADE SCRATCH[/bold yellow] Held >45s & weak momentum (diff={diff:.2f} bps). Extricating at ${sell_limit}.",
                         extra={"markup": True},
                     )
                     if is_dry:
@@ -282,6 +305,8 @@ class BTCStrategy:
                                 str(pos.num_shares.quantize(SIZE_TICK, rounding=ROUND_DOWN)),
                                 post_only=False,
                             )
+                            if pos in self.portfolio.open_positions:
+                                self.portfolio.open_positions.remove(pos)
                     self.last_sell_prices[pos.token_id] = sell_limit
                     self.stop_cooldowns[pos.condition_id] = time.time()
                     continue
@@ -321,6 +346,10 @@ class BTCStrategy:
         has_pos = any(p.token_id == target_token for p in existing_positions)
         has_pending = any(o.token_id == target_token for o in pending_orders)
 
+        if target_token not in self.price_buffers:
+            self.price_buffers[target_token] = PriceBuffer(maxlen=10)
+        self.price_buffers[target_token].add_tick(best_bid, best_ask)
+
         if not has_pos and not has_pending:
             cooldown_ts = self.stop_cooldowns.get(active_market["condition_id"], 0)
             remaining = 30 - (time.time() - cooldown_ts)
@@ -328,12 +357,9 @@ class BTCStrategy:
                 logger.info(f"⛔ GATE 3: Cooldown active — {remaining:.0f}s remaining")
                 return
 
-            # GATE 4: Minimum upside — don't enter if max payout < 25%
-            if limit_price > D("0.75"):
-                logger.info(f"⛔ GATE 4: Low upside — price ${limit_price} leaves < 25% to $1.00")
-                return
-            if limit_price < D("0.35"):
-                logger.info(f"⛔ GATE 4: Deep OTM — price ${limit_price} too cheap (need >= $0.35)")
+            # PHASE 4: Golden Zone ($0.40 - $0.60) exclusively
+            if limit_price > D("0.60") or limit_price < D("0.40"):
+                logger.info(f"⛔ GATE 4: Outside Golden Zone ($0.40-$0.60) — Price ${limit_price} rejected.")
                 return
 
             # GATE 4b: Time remaining guard — don't enter dying markets
@@ -348,8 +374,13 @@ class BTCStrategy:
                     logger.info(f"⛔ GATE 5: Re-entry blocked — ${limit_price} > last stop ${self.last_sell_prices[target_token]}")
                     return
 
-            if abs(diff) < 0.6:
-                logger.info(f"⛔ GATE 6: Momentum too weak — diff={diff:.2f} (need >=0.6)")
+            if abs(diff) < 1.0:
+                logger.info(f"⛔ GATE 6: Momentum too weak — diff={diff:.2f} bps (need >= 1.0 bps)")
+                return
+
+            # PHASE 2: Signal Blending (Oracle + Orderbook)
+            if not self.price_buffers[target_token].is_micro_pullback(float(limit_price)):
+                logger.info(f"⛔ GATE 8: Waiting for Orderbook micro-pullback (Chasing suppressed).")
                 return
 
             spread = best_ask - best_bid
